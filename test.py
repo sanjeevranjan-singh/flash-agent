@@ -99,7 +99,7 @@ MCP_INTERACTIONS_FILE = os.getenv("MCP_INTERACTIONS_FILE")
 
 # Scan behaviour
 TRACE_TAGS    = [t.strip() for t in os.getenv("TRACE_TAGS", "").split(",") if t.strip()]
-SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "300"))
+SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "0"))
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Graceful shutdown
@@ -334,15 +334,15 @@ Reply with EXACTLY one word: kubernetes  OR  prometheus.  No explanation."""
 def agent_request_tool_selection(
     user_query: str,
     otl_tracer: Optional[trace.Tracer],
-    langfuse_client: Optional["Langfuse"],
-    scan_id: str,
+    langfuse_client: Optional["Langfuse"] = None,
+    scan_id: str = "",
 ) -> str:
     """
     Agent → LLM Gateway: ask which MCP tool to use for this scan query.
 
     Storage:
       Rule ② – LLM Req+Res span → OTL Collector
-      Rule ③ – generation also logged to Langfuse direct client
+      Rule ③ – generation also logged to Langfuse (via Langfuse v4 API)
     Returns 'kubernetes' or 'prometheus'.
     """
     messages: List[Dict[str, str]] = [
@@ -350,18 +350,13 @@ def agent_request_tool_selection(
     ]
     logger.info("Agent → LLM Gateway: requesting tool selection …")
 
-    # Langfuse direct generation (rule ③)
+    # Langfuse direct generation (rule ③) – Langfuse v4 API
     lf_generation = None
     if langfuse_client:
         try:
-            lf_trace = langfuse_client.trace(
-                id=f"{scan_id}-tool-select",
-                name="agent-tool-selection",
-                metadata={"agent": AGENT_NAME, "namespace": K8S_NAMESPACE},
-                tags=TRACE_TAGS,
-            )
-            lf_generation = lf_trace.generation(
+            lf_generation = langfuse_client.start_observation(
                 name="llm-tool-selection",
+                as_type="generation",
                 model=MODEL_ALIAS,
                 input=messages,
             )
@@ -409,15 +404,18 @@ def agent_request_tool_selection(
             extra_attrs={"llm.decision": decision},
         )
 
-    # Rule ③: finalise Langfuse generation
+    # Rule ③: finalise Langfuse generation (v4 API: update then end)
     if lf_generation:
         try:
-            lf_generation.end(
+            lf_generation.update(
                 output=output_text or decision,
-                usage={"input": usage.get("prompt_tokens", 0),
-                       "output": usage.get("completion_tokens", 0)},
+                usage_details={
+                    "input":  usage.get("prompt_tokens", 0),
+                    "output": usage.get("completion_tokens", 0),
+                },
                 metadata={"decision": decision, "duration_sec": round(duration, 3)},
             )
+            lf_generation.end()
         except Exception as exc:
             logger.warning("Langfuse generation.end failed: %s", exc)
 
@@ -574,8 +572,8 @@ def agent_call_mcp_server(
     server_type: str,
     query: str,
     otl_tracer: Optional[trace.Tracer],
-    langfuse_client: Optional["Langfuse"],
-    scan_id: str,
+    langfuse_client: Optional["Langfuse"] = None,
+    scan_id: str = "",
 ) -> Dict[str, Any]:
     """
     Agent → MCP Server: fetch operational data using the selected tool.
@@ -584,7 +582,7 @@ def agent_call_mcp_server(
     Storage:
       Rule ①a – Req+Res → separate JSONL file  (mcp_interactions.jsonl)
       Rule ①b – Req+Res → OTL Collector span
-      Rule ③  – Langfuse direct span
+      Rule ③  – Langfuse span (via Langfuse v4 API)
     """
     if server_type not in ("kubernetes", "prometheus"):
         raise ValueError(f"Unknown MCP server: {server_type!r}")
@@ -680,22 +678,25 @@ def agent_call_mcp_server(
             scan_id=scan_id,
         )
 
-    # Rule ③: Langfuse direct span
+    # Rule ③: Langfuse MCP span (v4 API: start_observation + update + end)
     if langfuse_client:
         try:
-            lf_trace = langfuse_client.trace(
-                id=f"{scan_id}-mcp-{server_type}",
-                name="agent-mcp-call",
-                metadata={"server_type": server_type, "url": url},
-                tags=TRACE_TAGS,
-            )
-            lf_trace.span(
+            mcp_span = langfuse_client.start_observation(
                 name=f"mcp-{server_type}-request",
+                as_type="span",
                 input=request_payload,
-                output=response_payload,
-                metadata={"duration_sec": round(duration, 3),
-                          "has_error":    "error" in response_payload},
             )
+            mcp_span.update(
+                output=response_payload,
+                metadata={
+                    "server_type":  server_type,
+                    "url":          url,
+                    "duration_sec": round(duration, 3),
+                    "has_error":    "error" in response_payload,
+                },
+            )
+            mcp_span.end()
+            logger.info("③ MCP Langfuse span recorded for %s", server_type)
         except Exception as exc:
             logger.warning("Langfuse MCP span failed: %s", exc)
 
@@ -733,15 +734,15 @@ def agent_request_llm_analysis(
     mcp_data: Dict[str, Any],
     server_type: str,
     otl_tracer: Optional[trace.Tracer],
-    langfuse_client: Optional["Langfuse"],
-    scan_id: str,
+    langfuse_client: Optional["Langfuse"] = None,
+    scan_id: str = "",
 ) -> Optional[Dict[str, Any]]:
     """
     Agent → LLM Gateway: send the Tool Response from MCP for deep analysis.
 
     Storage:
       Rule ② – LLM Req+Res span → OTL Collector
-      Rule ③ – generation also logged to Langfuse direct client
+      Rule ③ – generation also logged to Langfuse (via Langfuse v4 API)
     Returns parsed analysis dict or None on failure.
     """
     payload_text = (
@@ -764,18 +765,13 @@ def agent_request_llm_analysis(
         server_type, len(combined_prompt),
     )
 
-    # Langfuse direct generation (rule ③)
+    # Langfuse direct generation (rule ③) – Langfuse v4 API
     lf_generation = None
     if langfuse_client:
         try:
-            lf_trace = langfuse_client.trace(
-                id=f"{scan_id}-analysis",
-                name="agent-llm-analysis",
-                metadata={"server_type": server_type, "agent": AGENT_NAME},
-                tags=TRACE_TAGS,
-            )
-            lf_generation = lf_trace.generation(
+            lf_generation = langfuse_client.start_observation(
                 name="llm-analysis",
+                as_type="generation",
                 model=MODEL_ALIAS,
                 input=messages,
             )
@@ -836,13 +832,15 @@ def agent_request_llm_analysis(
             },
         )
 
-    # Rule ③: finalise Langfuse generation
+    # Rule ③: finalise Langfuse generation (v4 API: update then end)
     if lf_generation:
         try:
-            lf_generation.end(
+            lf_generation.update(
                 output=output_text,
-                usage={"input": usage.get("prompt_tokens", 0),
-                       "output": usage.get("completion_tokens", 0)},
+                usage_details={
+                    "input":  usage.get("prompt_tokens", 0),
+                    "output": usage.get("completion_tokens", 0),
+                },
                 metadata={
                     "has_result":   result is not None,
                     "issue_count":  len(result.get("issues", [])) if result else 0,
@@ -850,6 +848,7 @@ def agent_request_llm_analysis(
                     "duration_sec": round(duration, 3),
                 },
             )
+            lf_generation.end()
         except Exception as exc:
             logger.warning("Langfuse analysis generation.end failed: %s", exc)
 
@@ -945,6 +944,95 @@ def agent_workflow(
         f"-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')}"
     )
     logger.info("═══ Scan started | scan_id=%s ═══", scan_id)
+
+    # ── Run entire scan inside a Langfuse root span (v4 API) ─────────────────
+    #    All steps (LLM + MCP) attach as children of this one root span.
+    analysis = _run_scan_steps(
+        scan_query=scan_query,
+        scan_id=scan_id,
+        scan_start=scan_start,
+        otl_tracer=otl_tracer,
+        langfuse_client=langfuse_client,
+    )
+
+    return analysis
+
+
+def _run_scan_steps(
+    scan_query: str,
+    scan_id: str,
+    scan_start: float,
+    otl_tracer: Optional[trace.Tracer],
+    langfuse_client: Optional["Langfuse"],
+) -> Dict[str, Any]:
+    """Execute all scan steps, optionally inside a Langfuse root span."""
+
+    if langfuse_client:
+        try:
+            with langfuse_client.start_as_current_observation(
+                name="agent-scan",
+                as_type="span",
+                input={"scan_query": scan_query, "scan_id": scan_id},
+                metadata={
+                    "agent":      AGENT_NAME,
+                    "namespace":  K8S_NAMESPACE,
+                },
+            ) as root_span:
+                logger.info("③ Langfuse root span created")
+                result = _execute_scan_steps(
+                    scan_query=scan_query,
+                    scan_id=scan_id,
+                    scan_start=scan_start,
+                    otl_tracer=otl_tracer,
+                    langfuse_client=langfuse_client,
+                )
+                # Update root span with final output before context closes
+                duration = time.time() - scan_start
+                health = result.get("health", {}) if isinstance(result, dict) else {}
+                root_span.update(
+                    output=result,
+                    metadata={
+                        "duration_sec":    round(duration, 3),
+                        "health_score":    health.get("overall_health_score"),
+                        "issue_count":     len(result.get("issues", [])) if isinstance(result, dict) else 0,
+                    },
+                )
+        except Exception as exc:
+            logger.warning("Langfuse root span failed: %s", exc)
+            # Fall through to run without Langfuse
+            result = _execute_scan_steps(
+                scan_query=scan_query,
+                scan_id=scan_id,
+                scan_start=scan_start,
+                otl_tracer=otl_tracer,
+                langfuse_client=None,
+            )
+        finally:
+            try:
+                langfuse_client.flush()
+                logger.info("③ Langfuse traces flushed to cloud")
+            except Exception as exc:
+                logger.warning("Langfuse flush failed: %s", exc)
+    else:
+        result = _execute_scan_steps(
+            scan_query=scan_query,
+            scan_id=scan_id,
+            scan_start=scan_start,
+            otl_tracer=otl_tracer,
+            langfuse_client=None,
+        )
+
+    return result
+
+
+def _execute_scan_steps(
+    scan_query: str,
+    scan_id: str,
+    scan_start: float,
+    otl_tracer: Optional[trace.Tracer],
+    langfuse_client: Optional["Langfuse"],
+) -> Dict[str, Any]:
+    """Core scan steps – called within Langfuse root observation context."""
 
     # ── Step 1: Agent → LLM Gateway → which tool?  (rule ②) ─────────────────
     server_type = agent_request_tool_selection(
