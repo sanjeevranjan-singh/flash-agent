@@ -607,189 +607,6 @@ def _extract_active_pod_names(
     return pod_names
 
 
-def _build_mcp_trace_summary(response_payload: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Build a compact but meaningful summary of MCP response data for Langfuse traces.
-    Extracts key operational signals instead of dumping raw text.
-    This is ONLY for trace display — does NOT affect what flows to the LLM.
-    """
-    import re as _re
-
-    if "error" in response_payload:
-        return {"status": "error", "error": str(response_payload.get("error", ""))[:200]}
-
-    mcp_data = response_payload.get("data", {})
-    summary: Dict[str, Any] = {"status": "ok"}
-
-    # ── pods_list_in_namespace → pod status breakdown ────────────────────────
-    pods_text = _extract_mcp_text(mcp_data.get("pods_list_in_namespace", {}))
-    if pods_text:
-        status_counts: Dict[str, int] = {}
-        total_restarts = 0
-        high_restart_pods: List[str] = []
-        for line in pods_text.strip().split("\n"):
-            if line.startswith("NAMESPACE") or not line.strip():
-                continue
-            parts = line.split()
-            if len(parts) >= 6:
-                pod_name = parts[3]
-                status = parts[5]
-                status_counts[status] = status_counts.get(status, 0) + 1
-                try:
-                    restarts = int(parts[6].split("(")[0]) if len(parts) > 6 else 0
-                    total_restarts += restarts
-                    if restarts > 0:
-                        high_restart_pods.append(f"{pod_name} ({restarts})")
-                except (ValueError, IndexError):
-                    pass
-        summary["pods"] = {
-            "total": sum(status_counts.values()),
-            "by_status": status_counts,
-            "total_restarts": total_restarts,
-        }
-        if high_restart_pods:
-            summary["pods"]["restarted_pods"] = high_restart_pods[:5]
-
-    # ── events_list → event type breakdown ───────────────────────────────────
-    events_text = _extract_mcp_text(mcp_data.get("events_list", {}))
-    if events_text:
-        if "No events found" in events_text or not events_text.strip():
-            summary["events"] = {"total": 0, "note": "No events found"}
-        else:
-            warning_reasons: List[str] = []
-            normal_count = 0
-            warning_count = 0
-            for line in events_text.strip().split("\n"):
-                if line.startswith("NAMESPACE") or not line.strip():
-                    continue
-                if "Warning" in line:
-                    warning_count += 1
-                    for keyword in ("BackOff", "Failed", "FailedScheduling",
-                                    "Unhealthy", "OOMKilling", "Evicted",
-                                    "FailedMount", "FailedCreate"):
-                        if keyword in line:
-                            warning_reasons.append(keyword)
-                            break
-                elif "Normal" in line:
-                    normal_count += 1
-            summary["events"] = {"normal": normal_count, "warning": warning_count}
-            if warning_reasons:
-                summary["events"]["warning_reasons"] = warning_reasons[:5]
-
-    # ── pods_top → resource usage or error ───────────────────────────────────
-    pods_top_data = mcp_data.get("pods_top", {})
-    pods_top_text = _extract_mcp_text(pods_top_data)
-    if isinstance(pods_top_data, dict) and "error" in pods_top_data:
-        summary["pods_top"] = {"error": str(pods_top_data["error"])[:100]}
-    elif pods_top_text and "error" in pods_top_text.lower():
-        summary["pods_top"] = {"error": pods_top_text[:100]}
-    elif pods_top_text:
-        summary["pods_top"] = {"available": True, "lines": len(pods_top_text.strip().split("\n"))}
-
-    # ── chaosengines → engine names ──────────────────────────────────────────
-    engines_text = _extract_mcp_text(mcp_data.get("chaosengines", {}))
-    if engines_text and engines_text.strip():
-        engine_names: List[str] = []
-        for line in engines_text.strip().split("\n"):
-            if line.startswith("NAMESPACE") or not line.strip():
-                continue
-            parts = line.split()
-            if len(parts) >= 4:
-                engine_names.append(parts[3])
-        summary["chaosengines"] = {"count": len(engine_names), "engines": engine_names[:10]}
-    else:
-        summary["chaosengines"] = {"count": 0}
-
-    # ── chaosresults → result names ──────────────────────────────────────────
-    results_text = _extract_mcp_text(mcp_data.get("chaosresults", {}))
-    if results_text and results_text.strip():
-        result_names: List[str] = []
-        for line in results_text.strip().split("\n"):
-            if line.startswith("NAMESPACE") or not line.strip():
-                continue
-            parts = line.split()
-            if len(parts) >= 4:
-                result_names.append(parts[3])
-        summary["chaosresults"] = {"count": len(result_names), "results": result_names[:10]}
-    else:
-        summary["chaosresults"] = {"count": 0}
-
-    # ── argo_workflows → workflow name, phase, age ───────────────────────────
-    argo_text = _extract_mcp_text(mcp_data.get("argo_workflows", {}))
-    if argo_text and argo_text.strip():
-        workflows: List[Dict[str, str]] = []
-        for line in argo_text.strip().split("\n"):
-            if line.startswith("NAMESPACE") or not line.strip():
-                continue
-            parts = line.split()
-            if len(parts) >= 4:
-                wf_name = parts[3]
-                wf_phase = "Unknown"
-                wf_age = ""
-                for p in parts[4:]:
-                    if p in ("Succeeded", "Failed", "Running", "Error", "Pending"):
-                        wf_phase = p
-                    if p and p[-1] in ("d", "h", "m", "s") and p[:-1].replace(".", "").isdigit():
-                        wf_age = p
-                workflows.append({"name": wf_name, "phase": wf_phase, "age": wf_age})
-        # Identify experiment workflows (names ending with 10+ digit epoch suffix)
-        def _wf_epoch(wf: Dict[str, str]) -> int:
-            try:
-                suffix = wf["name"].rsplit("-", 1)[1]
-                return int(suffix) if len(suffix) >= 10 else 0
-            except (ValueError, IndexError):
-                return 0
-        experiment_wfs = sorted(
-            [w for w in workflows if _wf_epoch(w) > 0],
-            key=_wf_epoch, reverse=True,
-        )
-        other_wfs = [w for w in workflows if _wf_epoch(w) == 0]
-        # Show all experiment workflows (newest first) + up to 3 others
-        sorted_wfs = experiment_wfs + other_wfs[:3]
-        summary["argo_workflows"] = {
-            "count": len(workflows),
-            "latest": experiment_wfs[0]["name"] if experiment_wfs else "none",
-            "workflows": sorted_wfs,
-        }
-    else:
-        summary["argo_workflows"] = {"count": 0}
-
-    # ── pods_log → log sizes + key signals per pod ───────────────────────────
-    pods_log = mcp_data.get("pods_log", {})
-    if isinstance(pods_log, dict) and pods_log:
-        log_summary: Dict[str, Any] = {}
-        for pod_name, log_data in pods_log.items():
-            log_text = _extract_mcp_text(log_data)
-            pod_info: Dict[str, Any] = {"size": f"{len(log_text)} chars"}
-
-            if "chaos-exporter" in pod_name:
-                faults_found = set(_re.findall(r"FaultName=(\S+)", log_text))
-                verdicts_found = _re.findall(
-                    r"FaultName=(\S+).*?ResultVerdict=(\S+)", log_text)
-                latest: Dict[str, str] = {}
-                for f, v in verdicts_found:
-                    latest[f] = v
-                pod_info["faults_reporting"] = sorted(faults_found)
-                pod_info["latest_verdicts"] = latest
-            elif "chaos-operator" in pod_name:
-                pod_info["reconcile_events"] = log_text.count("Reconciling ChaosEngine")
-                pod_info["errors"] = (
-                    log_text.count("level=error")
-                    + log_text.count('"level":"error"')
-                )
-            else:
-                error_lines = [l.strip() for l in log_text.split("\n")
-                               if "error" in l.lower()]
-                if error_lines:
-                    pod_info["errors"] = len(error_lines)
-                    pod_info["last_error"] = error_lines[-1][:150]
-
-            log_summary[pod_name] = pod_info
-        summary["pods_log"] = log_summary
-
-    return summary
-
-
 def agent_call_mcp_server(
     server_type: str,
     query: str,
@@ -853,8 +670,7 @@ def agent_call_mcp_server(
     request_payload: Dict[str, Any] = {
         "server_type": server_type,
         "namespace":   K8S_NAMESPACE,
-        "tools": [result_key for _, _, result_key in tool_calls],
-        "tool_count": len(tool_calls),
+        "tool_calls":  [(name, args) for name, args, _ in tool_calls],
         "timestamp":   datetime.now(timezone.utc).isoformat(),
     }
 
@@ -976,16 +792,10 @@ def agent_call_mcp_server(
             mcp_span = langfuse_client.start_observation(
                 name=f"mcp-{server_type}-request",
                 as_type="span",
-                input={
-                    "server": server_type,
-                    "namespace": K8S_NAMESPACE,
-                    "tools": [rk for _, _, rk in tool_calls],
-                },
+                input=request_payload,
             )
-            # Build compact meaningful summary for trace (full data still goes to LLM)
-            trace_output = _build_mcp_trace_summary(response_payload)
             mcp_span.update(
-                output=trace_output,
+                output=response_payload,
                 metadata={
                     "server_type":  server_type,
                     "url":          url,
@@ -1095,69 +905,23 @@ def _extract_mcp_text(mcp_result: Any) -> str:
 def _parse_workflow_phase_from_text(argo_data: Any) -> Dict[str, str]:
     """
     Parse the Argo Workflow text table from MCP resources_list.
-    Returns {workflow_name: phase} for all workflows whose name ends with
-    an epoch-like numeric suffix (e.g. my-experiment-1774000085040).
-    Fully dynamic — no hardcoded workflow prefix.
+    Returns {workflow_name: phase} for sock-shop-trace-1803 workflows.
     """
     result: Dict[str, str] = {}
     text = _extract_mcp_text(argo_data)
     for line in text.split("\n"):
-        if not line.strip() or line.startswith("NAMESPACE"):
+        if "sock-shop-trace-1803" not in line:
             continue
         parts = line.split()
-        if len(parts) < 4:
-            continue
-        wf_name = parts[3]
-        # Check if name ends with an epoch-like suffix (10+ digit number)
-        suffix = wf_name.rsplit("-", 1)[-1] if "-" in wf_name else ""
-        if not (suffix.isdigit() and len(suffix) >= 10):
-            continue
-        # Extract phase from subsequent columns
-        for candidate in parts[4:]:
-            if candidate in ("Succeeded", "Failed", "Running", "Error", "Pending"):
-                result[wf_name] = candidate
+        for idx, p in enumerate(parts):
+            if p.startswith("sock-shop-trace-1803"):
+                for candidate in parts[idx + 1:]:
+                    if candidate in ("Succeeded", "Failed", "Running", "Error", "Pending"):
+                        result[p] = candidate
+                        break
                 break
     logger.info("Parsed workflow phases from text: %s", result)
     return result
-
-
-def _get_latest_workflow(wf_phases: Dict[str, str]) -> tuple:
-    """
-    From a dict of {workflow_name: phase}, find the LATEST workflow
-    by extracting the epoch timestamp suffix.
-
-    Workflow names follow the pattern: <prefix>-<epoch_millis>
-    Higher epoch = more recent run.
-
-    Returns (latest_wf_name, latest_wf_phase). Falls back to ("", "Unknown").
-    """
-    if not wf_phases:
-        return ("", "Unknown")
-
-    best_name = ""
-    best_phase = "Unknown"
-    best_epoch = -1
-
-    for wf_name, phase in wf_phases.items():
-        # Extract the epoch suffix: <prefix>-1774000085040
-        parts = wf_name.rsplit("-", 1)
-        if len(parts) == 2:
-            try:
-                epoch = int(parts[1])
-                if epoch > best_epoch:
-                    best_epoch = epoch
-                    best_name = wf_name
-                    best_phase = phase
-            except ValueError:
-                pass
-
-    # Fallback: if no epoch could be parsed, use the last entry
-    if not best_name and wf_phases:
-        best_name = list(wf_phases.keys())[-1]
-        best_phase = wf_phases[best_name]
-
-    logger.info("Latest workflow: %s (phase=%s, epoch=%d)", best_name, best_phase, best_epoch)
-    return (best_name, best_phase)
 
 
 def _parse_verdicts_from_exporter_logs(mcp_data: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
@@ -1211,146 +975,6 @@ def _parse_verdicts_from_exporter_logs(mcp_data: Dict[str, Any]) -> Dict[str, Di
     return verdicts
 
 
-def _build_verdict_text_for_prompt(
-    verdicts: Dict[str, Dict[str, Any]],
-) -> str:
-    """
-    Build the pre-extracted verdicts text block to inject into the LLM prompt.
-    Includes ALL expected chaos faults — marks missing ones explicitly.
-    """
-    chaos_steps = [s for s in EXPECTED_WORKFLOW_STEPS if s in CHAOS_STEP_METADATA]
-
-    lines: List[str] = []
-    found = 0
-    missing = 0
-    for fault_name in chaos_steps:
-        idx = found + missing + 1
-        if fault_name in verdicts:
-            v = verdicts[fault_name]
-            lines.append(
-                f"  {idx}. {fault_name}: "
-                f"verdict={v['verdict']}, "
-                f"probe_success_pct={v['probe_success_pct']}, "
-                f"is_final={v['is_final']}"
-            )
-            found += 1
-        else:
-            lines.append(
-                f"  {idx}. {fault_name}: "
-                f"verdict=NO EXPORTER DATA (not found in chaos-exporter logs)"
-            )
-            missing += 1
-
-    real_passed = sum(1 for v in verdicts.values() if v["verdict"] == "Pass")
-    real_failed = sum(1 for v in verdicts.values() if v["verdict"] == "Fail")
-
-    header = (
-        f"Total expected chaos faults: {len(chaos_steps)}\n"
-        f"Faults with exporter verdicts: {found}\n"
-        f"Faults with no exporter data: {missing}\n"
-        f"Faults passed (verdict=Pass): {real_passed}\n"
-        f"Faults failed (verdict=Fail): {real_failed}\n\n"
-    )
-    return header + "\n".join(lines) if lines else "  (no chaos faults expected)"
-
-
-def _cross_validate_llm_with_verdicts(
-    result: Dict[str, Any],
-    verdicts: Dict[str, Dict[str, Any]],
-) -> None:
-    """
-    Cross-validate LLM analysis against real exporter verdicts.
-    Corrects experiment_summary counts and fills missing chaos_faults.
-    Mutates *result* in place.
-    """
-    if not result:
-        return
-
-    chaos_steps = [s for s in EXPECTED_WORKFLOW_STEPS if s in CHAOS_STEP_METADATA]
-    real_passed = sum(1 for v in verdicts.values() if v["verdict"] == "Pass")
-    real_failed = sum(1 for v in verdicts.values() if v["verdict"] == "Fail")
-    real_no_data = len(chaos_steps) - len(verdicts)
-
-    # ── Fix experiment_summary counts ──
-    exp = result.get("experiment_summary", {})
-    if exp:
-        old_passed = exp.get("faults_passed", "?")
-        old_failed = exp.get("faults_failed", "?")
-        if old_passed != real_passed or old_failed != real_failed:
-            logger.warning(
-                "Cross-validation: LLM fault counts mismatch — correcting: "
-                "LLM said passed=%s failed=%s, real is passed=%d failed=%d no_data=%d",
-                old_passed, old_failed, real_passed, real_failed, real_no_data,
-            )
-        exp["total_faults_executed"] = len(chaos_steps)
-        exp["faults_passed"] = real_passed
-        exp["faults_failed"] = real_failed
-        exp.setdefault("faults_no_data", real_no_data)
-
-        # Recalculate resilience
-        if real_failed == 0 and real_no_data == 0:
-            exp["overall_resilience"] = "resilient"
-        elif real_failed == 0:
-            exp["overall_resilience"] = "partially-resilient"
-        elif real_failed <= real_passed:
-            exp["overall_resilience"] = "partially-resilient"
-        else:
-            exp["overall_resilience"] = "fragile"
-
-    # ── Ensure ALL expected faults appear in chaos_faults ──
-    llm_faults = result.get("chaos_faults", [])
-    llm_fault_names = {f.get("fault_name", "") for f in llm_faults}
-
-    for fault_name in chaos_steps:
-        if fault_name in llm_fault_names:
-            # Override verdict with real data if available
-            for f in llm_faults:
-                if f.get("fault_name") == fault_name and fault_name in verdicts:
-                    real = verdicts[fault_name]
-                    if f.get("verdict") != real["verdict"]:
-                        logger.warning(
-                            "Cross-validation: verdict mismatch for %s: LLM=%s real=%s — correcting",
-                            fault_name, f.get("verdict"), real["verdict"],
-                        )
-                    f["verdict"] = real["verdict"]
-                    f["probe_success_percentage"] = real["probe_success_pct"]
-        else:
-            # Fault missing from LLM output — add it
-            meta = CHAOS_STEP_METADATA.get(fault_name, {})
-            if fault_name in verdicts:
-                real = verdicts[fault_name]
-                llm_faults.append({
-                    "fault_name": fault_name,
-                    "verdict": real["verdict"],
-                    "probe_success_percentage": real["probe_success_pct"],
-                    "target_app": meta.get("target_app"),
-                    "target_kind": meta.get("target_kind"),
-                    "chaos_duration_sec": meta.get("duration"),
-                    "impact_observed": "LLM did not analyse this fault — added by cross-validation",
-                    "recovery_observed": "insufficient data to determine recovery from provided logs",
-                    "resilience_assessment": f"Verdict={real['verdict']} probe={real['probe_success_pct']}%",
-                })
-            else:
-                llm_faults.append({
-                    "fault_name": fault_name,
-                    "verdict": "No Exporter Data",
-                    "probe_success_percentage": None,
-                    "target_app": meta.get("target_app"),
-                    "target_kind": meta.get("target_kind"),
-                    "chaos_duration_sec": meta.get("duration"),
-                    "impact_observed": "chaos-exporter did not report this fault — logs may have rotated",
-                    "recovery_observed": "N/A",
-                    "resilience_assessment": "Cannot assess — no exporter data available",
-                })
-            logger.info("Cross-validation: added missing fault %s to LLM output", fault_name)
-
-    result["chaos_faults"] = llm_faults
-    logger.info(
-        "Cross-validation complete: %d faults total (passed=%d failed=%d no_data=%d)",
-        len(chaos_steps), real_passed, real_failed, real_no_data,
-    )
-
-
 def _record_workflow_step_spans(
     langfuse_client: "Langfuse",
     mcp_data: Dict[str, Any],
@@ -1371,25 +995,19 @@ def _record_workflow_step_spans(
     # 1. Parse real verdicts from chaos-exporter logs
     verdicts = _parse_verdicts_from_exporter_logs(mcp_data)
 
-    # 2. Parse workflow-level phase from argo text table and pick LATEST by epoch
+    # 2. Parse workflow-level phase from argo text table
     wf_phases = _parse_workflow_phase_from_text(mcp_data.get("argo_workflows", {}))
-    latest_wf_name, latest_wf_phase = _get_latest_workflow(wf_phases)
+    latest_wf_phase = "Unknown"
+    latest_wf_name = ""
+    for wf_name, phase in wf_phases.items():
+        latest_wf_name = wf_name
+        latest_wf_phase = phase
 
-    # 3. Build lookup from LLM chaos_faults for impact/recovery descriptions
+    # 3. Build lookup from LLM analysis for descriptions
     llm_faults: Dict[str, Dict] = {}
     if llm_analysis:
         for cf in llm_analysis.get("chaos_faults", []):
-            fname = cf.get("fault_name", "") or cf.get("step_name", "")
-            if fname:
-                llm_faults[fname] = cf
-
-    # 4. Build lookup from LLM workflow_steps for non-chaos step status
-    llm_steps: Dict[str, Dict] = {}
-    if llm_analysis:
-        for ws in llm_analysis.get("workflow_steps", []):
-            sname = ws.get("step_name", "")
-            if sname:
-                llm_steps[sname] = ws
+            llm_faults[cf.get("step_name", "")] = cf
 
     created = 0
     for i, step_name in enumerate(EXPECTED_WORKFLOW_STEPS):
@@ -1432,26 +1050,15 @@ def _record_workflow_step_spans(
                 "verdict_source": "chaos-exporter logs (real)",
                 "verdict": real_verdict,
                 "probe_success_percentage": probe_pct,
-                "chaos_duration_sec": llm_fault.get("chaos_duration_sec", "N/A"),
                 "impact_observed": llm_fault.get("impact_observed", "N/A"),
                 "recovery_observed": llm_fault.get("recovery_observed", "N/A"),
-                "resilience_assessment": llm_fault.get("resilience_assessment", "N/A"),
                 "llm_verdict": llm_fault.get("verdict", "N/A"),
-                "llm_probe_pct": llm_fault.get("probe_success_percentage", "N/A"),
+                "llm_probe_verdict": llm_fault.get("probe_verdict", "N/A"),
             }
             level = "WARNING" if real_verdict == "Fail" else "DEFAULT"
 
         else:
-            llm_step = llm_steps.get(step_name, {})
-            llm_status = llm_step.get("status", "")
-
-            if llm_status in ("Succeeded", "Completed"):
-                icon = "\u2705"
-                phase = "Succeeded"
-            elif llm_status == "Failed":
-                icon = "\u274c"
-                phase = "Failed"
-            elif latest_wf_phase in ("Succeeded", "Running"):
+            if latest_wf_phase in ("Succeeded", "Running"):
                 icon = "\u2705"
                 phase = "Succeeded"
             elif latest_wf_phase == "Failed":
@@ -1470,9 +1077,8 @@ def _record_workflow_step_spans(
             span_output = {
                 "phase": phase,
                 "workflow": latest_wf_name,
-                "details": llm_step.get("details", "N/A"),
             }
-            level = "WARNING" if phase == "Failed" else "DEFAULT"
+            level = "DEFAULT"
 
         try:
             step_span = langfuse_client.start_observation(
@@ -1484,7 +1090,7 @@ def _record_workflow_step_spans(
                     "scan_id": scan_id,
                     "step_index": i,
                     "is_chaos_fault": is_chaos,
-                    "workflow": latest_wf_name or "unknown",
+                    "workflow": latest_wf_name or "sock-shop-trace-1803",
                 },
             )
             step_span.update(output=span_output)
@@ -1504,313 +1110,236 @@ def _record_workflow_step_spans(
 # ══════════════════════════════════════════════════════════════════════════════
 
 _ANALYSIS_SYSTEM = """\
-You are an expert system-analysis LLM specializing in interpreting the results
-of controlled fault-injection experiments. Your job is to analyze ONLY the data
-provided to you. You must not rely on any prior knowledge of the experiment
-design, fault names, internal workflow steps, expected sequence, or any hidden
-structure.
-
-The raw data you receive may include:
-- System pod and workload states
-- Execution metadata from a workflow engine
-- Fault result objects produced by the experiment framework
-- Logs from components that record fault execution or probe outcomes
-- Application or probe logs (if available)
-
-You must infer everything STRICTLY from the evidence present in the data.
-
--------------------------------------------------------------------------------
-YOUR ANALYSIS TASK
--------------------------------------------------------------------------------
-
-Analyze ONLY the most recent experiment run (identified by the latest timestamp
-or highest numeric suffix in identifiers visible in the data). You must produce:
-
-1. EXPERIMENT SUMMARY
-   - Identify the latest workflow/run name (based on visible identifiers).
-   - Determine its overall phase (Succeeded, Failed, Running) based ONLY on what
-     the data shows.
-   - Compute fault counts directly from the authoritative list above:
-       total_faults_executed
-       faults_passed
-       faults_failed
-   - Provide overall resilience classification in one of:
-       "resilient" | "partially-resilient" | "fragile"
-     Base this ONLY on fault outcomes and observed behavior.
-
-2. WORKFLOW STEPS (GENERIC)
-   The workflow may contain multiple execution steps, but their names or roles
-   must NOT be assumed by you.
-
-   For each execution step you discover (from workflow metadata, pod names,
-   or logs):
-   - step_name: use ONLY the name/identifier visible in the data
-   - step_number: infer ordering based on workflow metadata
-   - status: Succeeded | Failed | Skipped | Unknown
-   - details: summarize what the logs or metadata show; if unclear, say
-       "insufficient data"
-
-   DO NOT use or assume any step names not present in the raw data.
-
-3. CHAOS FAULT ANALYSIS
-   For each chaos fault you can identify from the data (ChaosResult objects,
-   chaos-exporter logs, workflow step names, etc.):
-
-   - fault_name: use the identifier visible in the data
-   - verdict: determine from ChaosResult verdict fields or exporter log lines
-   - probe_success_percentage: extract from probe results or exporter logs, or null
-   - target_app / target_kind:
-       infer ONLY if the raw data clearly contains target identifiers
-       otherwise set to null
-   - chaos_duration_sec:
-       infer from visible timestamps or duration fields if present
-       otherwise null
-
-   - impact_observed:
-       Use ONLY explicit evidence from:
-         * probe failures / success
-         * application or system logs
-         * result object messages
-         * workflow/pod status transitions
-       If no clear evidence exists:
-         "insufficient data to determine impact from provided logs"
-
-   - recovery_observed:
-       Use ONLY explicit evidence that shows recovery:
-         * probe recovery
-         * application returning to normal
-         * resolved error conditions
-       If not clearly shown:
-         "insufficient data to determine recovery from provided logs"
-
-   - resilience_assessment:
-       Provide a short, evidence-based statement about how well the
-       system handled the fault (no assumptions).
-
-4. WORKFLOW ERRORS
-   If any failures occurred:
-   - Identify the execution component or pod where the error occurred.
-   - Extract the actual error message (short, 1–2 lines).
-   - Determine the most likely root cause based on evidence.
-   - Provide a concise fix suggestion.
-
-5. ISSUES & HEALTH
-   Summarize system health indicators:
-   - Pod counts (healthy/unhealthy)
-   - Error/warning counts
-   - Overall health score (0–100)
-
--------------------------------------------------------------------------------
-RETURN FORMAT (STRICT)
--------------------------------------------------------------------------------
-
-Return ONLY valid JSON:
-
-{
-  "experiment_summary": {
-    "workflow_name": "<latest workflow name>",
-    "workflow_phase": "Succeeded|Failed|Running",
-    "total_faults_executed": <int>,
-    "faults_passed": <int>,
-    "faults_failed": <int>,
-    "overall_resilience": "<resilient|partially-resilient|fragile>"
-  },
-  "workflow_steps": [
+# =============================================================================
+# Flash-Agent System Prompts for AgentCert IT-Ops Evaluation
+# =============================================================================
+# These prompts drive the Flash-Agent through a 4-phase fault remediation
+# protocol. The agent's structured JSON output is parsed by the interceptor
+# and forwarded to the observability backend as discrete spans.
+#
+# Telemetry mapping (handled by interceptor, transparent to agent):
+#   Phase 1 (FAULT_DETECTION)  → fault detection data
+#   Phase 2 (DIAGNOSIS)        → fault identification & remediation plan
+#   Phase 3 (REMEDIATION)      → summary of actions taken
+#   Phase 4 (VERIFICATION)     → end results + LLM analysis summary
+#   tools_used (all phases)    → tool usage data
+#   Raw tool calls             → auto-captured by agent framework
+# =============================================================================
+ 
+flash_agent:
+  # ---------------------------------------------------------------------------
+  # Main system prompt — injected as `instructions` into ChatAgent
+  # ---------------------------------------------------------------------------
+  system_prompt: |
+    You are Flash-Agent, an expert IT-Operations agent built for the AgentCert
+    battle-testing platform. Your mission is to detect, diagnose, and remediate
+    faults in Kubernetes workloads, then report your findings in a structured
+    format that enables performance evaluation and scoring.
+ 
+    ## OPERATING CONTEXT
+    You are being evaluated by the AgentCert framework. Every action you take,
+    every tool you call, and every decision you make is being traced and scored.
+    Your goal is not just to fix the problem — it is to demonstrate clear,
+    methodical, traceable reasoning throughout.
+ 
+    ## AVAILABLE TOOLS
+    You have access to Kubernetes MCP and Prometheus MCP servers. Use them to:
+    - Query pod/deployment/service status and events
+    - Read container logs
+    - Inspect Prometheus metrics (error rates, latency, resource usage)
+    - Execute remediation actions (restart, scale, patch, rollback)
+ 
+    ## EXECUTION PROTOCOL
+ 
+    Follow this exact 4-phase protocol. After completing ALL phases, produce a
+    single JSON report with the structure shown below. Do NOT skip phases.
+    Do NOT combine phases. If a phase finds nothing, include it with empty
+    arrays and null values.
+ 
+    ### PHASE 1: FAULT DETECTION
+    Investigate the operational environment to identify anomalies.
+    - Query pod status, deployment health, service connectivity
+    - Check Prometheus metrics for error rates, latency spikes, resource pressure
+    - Inspect recent events and logs for error patterns
+    - Record a timestamp when you first detect an anomaly
+ 
+    ### PHASE 2: DIAGNOSIS AND REMEDIATION PLAN
+    Identify root cause and formulate a remediation plan.
+    - Correlate anomalies with likely root causes
+    - Determine order of remediation steps
+    - Assess risk and reversibility of each planned action
+    - Explain WHY you concluded what the root cause is
+ 
+    ### PHASE 3: REMEDIATION EXECUTION
+    Execute the remediation plan and report each action.
+    - Execute each planned step sequentially
+    - Verify intermediate results after each action
+    - Adapt the plan if a step fails or produces unexpected results
+    - Record which tools were called and whether they succeeded
+ 
+    ### PHASE 4: VERIFICATION AND ANALYSIS
+    Verify recovery and provide final analysis.
+    - Re-check all previously affected resources
+    - Compare current state against pre-fault baseline
+    - Provide an honest assessment of remediation effectiveness
+    - Estimate time-to-detect and time-to-remediate
+ 
+    ## OUTPUT FORMAT
+ 
+    After completing all phases, return ONLY a single valid JSON object with
+    this exact structure:
+ 
+    ```json
     {
-      "step_name": "<identifier from data>",
-      "step_number": <int>,
-      "status": "Succeeded|Failed|Skipped|Unknown",
-      "details": "<what happened>"
+      "phases": [
+        {
+          "phase": "FAULT_DETECTION",
+          "timestamp": "<ISO-8601 when detection started>",
+          "detection_summary": "<one-sentence summary of what was detected>",
+          "anomalies": [
+            {
+              "type": "<CrashLoop|OOM|ImagePull|Misconfig|Connectivity|Latency|ErrorRate|ResourcePressure|HealthCheck|Other>",
+              "severity": "<critical|warning|info>",
+              "affected_resource": "<pod/deployment/service name>",
+              "namespace": "<namespace>",
+              "evidence": "<specific data point confirming the anomaly>",
+              "confidence": <0.0-1.0>
+            }
+          ],
+          "health_snapshot": {
+            "total_pods": <int>,
+            "healthy_pods": <int>,
+            "unhealthy_pods": <int>,
+            "error_count": <int>,
+            "warning_count": <int>,
+            "overall_health_score": <0-100>
+          },
+          "tools_used": ["<tool_name(args_summary)>"]
+        },
+        {
+          "phase": "DIAGNOSIS",
+          "timestamp": "<ISO-8601 when diagnosis started>",
+          "root_cause_analysis": {
+            "identified_fault": "<specific fault type>",
+            "root_cause": "<concise root cause explanation>",
+            "affected_components": ["<component1>", "<component2>"],
+            "blast_radius": "<isolated|service-level|namespace-wide|cluster-wide>"
+          },
+          "remediation_plan": [
+            {
+              "step": <int>,
+              "action": "<description of the action>",
+              "target": "<resource to act on>",
+              "risk_level": "<low|medium|high>",
+              "reversible": <true|false>,
+              "rationale": "<why this step is needed>"
+            }
+          ],
+          "tools_used": ["<tool_name(args_summary)>"]
+        },
+        {
+          "phase": "REMEDIATION",
+          "timestamp": "<ISO-8601 when remediation started>",
+          "actions_taken": [
+            {
+              "step": <int>,
+              "action": "<what was done>",
+              "tool_call": "<exact tool and arguments used>",
+              "result": "<outcome of the action>",
+              "success": <true|false>,
+              "duration_hint": "<approximate time taken>"
+            }
+          ],
+          "plan_adaptations": "<deviations from the original plan and why, or null>",
+          "tools_used": ["<tool_name(args_summary)>"]
+        },
+        {
+          "phase": "VERIFICATION",
+          "timestamp": "<ISO-8601 when verification started>",
+          "recovery_status": {
+            "fully_recovered": <true|false>,
+            "recovered_components": ["<component>"],
+            "still_affected": ["<component>"],
+            "health_score_before": <0-100>,
+            "health_score_after": <0-100>
+          },
+          "llm_analysis_summary": {
+            "fault_type_detected": "<what fault was found>",
+            "detection_method": "<how it was found>",
+            "remediation_effectiveness": "<effective|partially_effective|ineffective>",
+            "time_to_detect_estimate": "<estimated TTD as duration string>",
+            "time_to_remediate_estimate": "<estimated TTR as duration string>",
+            "lessons_learned": "<what would improve future responses>",
+            "confidence_in_resolution": <0.0-1.0>
+          },
+          "end_result": "<RESOLVED|PARTIALLY_RESOLVED|UNRESOLVED|ESCALATED>",
+          "tools_used": ["<tool_name(args_summary)>"]
+        }
+      ]
     }
-  ],
-  "chaos_faults": [
-    {
-      "fault_name": "<from pre-extracted list>",
-      "verdict": "<Pass|Fail|Awaited|No Observable Data>",
-      "probe_success_percentage": <int|null>,
-      "target_app": "<inferred or null>",
-      "target_kind": "<inferred or null>",
-      "chaos_duration_sec": <int|null>,
-      "impact_observed": "<impact or insufficient data>",
-      "recovery_observed": "<recovery or insufficient data>",
-      "resilience_assessment": "<evidence-based assessment>"
-    }
-  ],
-  "workflow_errors": [
-    {
-      "workflow_name": "<string>",
-      "error_pod": "<identifier>",
-      "error_step": "<identifier>",
-      "error_message": "<actual log excerpt>",
-      "root_cause": "<why it failed>",
-      "fix_suggestion": "<suggested fix>"
-    }
-  ],
-  "issues": [
-    {
-      "severity": "critical|warning|info",
-      "affected_pod": "<id or N/A>",
-      "category": "ChaosExperiment|WorkflowFailure|CrashLoop|OOM|Other",
-      "related_fault": "<fault name or none>",
-      "summary": "<one sentence>",
-      "recommended_action": "<one sentence>"
-    }
-  ],
-  "health": {
-    "total_pods": <int>,
-    "healthy_pods": <int>,
-    "unhealthy_pods": <int>,
-    "error_count": <int>,
-    "warning_count": <int>,
-    "overall_health_score": <0-100>
-  }
-}
-
--------------------------------------------------------------------------------
-CRITICAL RULES
--------------------------------------------------------------------------------
-1. You MUST include ALL faults from the pre-extracted list.
-2. Fault counts MUST match the pre-extracted list exactly.
-3. Use ONLY information visible in the data—no assumptions or guesses.
-4. For missing or unclear impact/recovery, use:
-   "insufficient data to determine impact from provided logs"
-5. Do NOT fabricate actions, steps, fault names, or system behavior.
-6. Output MUST be a valid JSON object conforming to the schema above.
-"""
-
-
-def _build_llm_data_payload(mcp_data: Dict[str, Any], server_type: str) -> str:
-    """
-    Build a structured data payload for the LLM instead of blindly truncating
-    raw JSON.  Ensures the most important data (chaos-exporter logs with fault
-    verdicts, Argo workflow list, pod status) is always included.
-
-    Budget: aim for ~12-15K chars total so the combined prompt + data stays
-    within free-tier context limits.
-    """
-    import re as _re
-
-    sections: List[str] = []
-    sections.append(
-        f"Data source : {server_type.upper()} MCP Tool Response\n"
-        f"Namespace   : {K8S_NAMESPACE}\n"
-        f"Timestamp   : {datetime.now(timezone.utc).isoformat()}\n"
-    )
-
-    # ── 1. Pod status summary (compact) ──────────────────────────────────────
-    summary = _build_mcp_trace_summary(mcp_data)
-    pods = summary.get("pods", {})
-    if pods:
-        sections.append(
-            f"## POD STATUS\n"
-            f"Total: {pods.get('total', '?')} | "
-            f"By status: {json.dumps(pods.get('by_status', {}))}\n"
-            f"Total restarts: {pods.get('total_restarts', 0)}\n"
-            f"High-restart pods: {json.dumps(pods.get('restarted_pods', []))}"
-        )
-
-    # ── 2. Events summary ────────────────────────────────────────────────────
-    events = summary.get("events", {})
-    if events:
-        sections.append(f"## EVENTS\n{json.dumps(events)}")
-
-    # ── 3. Argo Workflows (sorted newest-first, latest marked) ────────────────
-    argo = summary.get("argo_workflows", {})
-    if argo.get("count", 0) > 0:
-        latest_name = argo.get("latest", "")
-        wf_lines = []
-        for w in argo.get("workflows", []):
-            marker = " ← LATEST" if w["name"] == latest_name else ""
-            wf_lines.append(
-                f"  - {w['name']}  phase={w.get('phase','?')}  age={w.get('age','?')}{marker}"
-            )
-        sections.append(
-            f"## ARGO WORKFLOWS ({argo['count']} total)\n"
-            f"Latest experiment workflow: {latest_name}\n"
-            + "\n".join(wf_lines)
-        )
-
-    # ── 4. ChaosResults ──────────────────────────────────────────────────────
-    cr = summary.get("chaosresults", {})
-    if cr.get("count", 0) > 0:
-        sections.append(
-            f"## CHAOSRESULTS ({cr['count']} total)\n"
-            f"  Names: {json.dumps(cr.get('results', []))}"
-        )
-
-    # ── 5. ChaosEngines ──────────────────────────────────────────────────────
-    ce = summary.get("chaosengines", {})
-    if ce.get("count", 0) > 0:
-        sections.append(
-            f"## CHAOSENGINES ({ce['count']} total)\n"
-            f"  Names: {json.dumps(ce.get('engines', []))}"
-        )
-
-    # ── 6. chaos-exporter logs (CRITICAL — contains fault verdicts) ──────────
-    #    Include the FULL text (up to 20K) so the LLM always sees verdict lines
-    pods_log = mcp_data.get("data", mcp_data).get("pods_log", {})
-    if isinstance(pods_log, dict):
-        for pod_name, log_data in pods_log.items():
-            if "chaos-exporter" in pod_name:
-                log_text = _extract_mcp_text(log_data)
-                if log_text:
-                    # Extract just the verdict lines + keep full log up to 6K
-                    verdict_lines = [
-                        l.strip() for l in log_text.split("\n")
-                        if "FaultName=" in l or "ResultVerdict=" in l
-                           or "ProbeSuccessPercentage=" in l
-                    ]
-                    sections.append(
-                        f"## CHAOS-EXPORTER LOGS ({pod_name})\n"
-                        f"### Verdict lines (extracted):\n"
-                        + "\n".join(verdict_lines[-30:]) + "\n\n"
-                        f"### Full log (truncated to 6000 chars):\n"
-                        + log_text[-6000:]
-                    )
-
-    # ── 7. chaos-operator logs (compact) ─────────────────────────────────────
-    if isinstance(pods_log, dict):
-        for pod_name, log_data in pods_log.items():
-            if "chaos-operator" in pod_name:
-                log_text = _extract_mcp_text(log_data)
-                if log_text:
-                    sections.append(
-                        f"## CHAOS-OPERATOR LOGS ({pod_name})\n"
-                        + log_text[-2000:]
-                    )
-
-    # ── 8. Workflow pod logs (error lines only — for workflow_errors) ────────
-    if isinstance(pods_log, dict):
-        wf_log_parts: List[str] = []
-        for pod_name, log_data in pods_log.items():
-            if "chaos-exporter" in pod_name or "chaos-operator" in pod_name:
-                continue
-            log_text = _extract_mcp_text(log_data)
-            if log_text:
-                error_lines = [
-                    l.strip() for l in log_text.split("\n")
-                    if "error" in l.lower() or "failed" in l.lower()
-                ]
-                if error_lines:
-                    wf_log_parts.append(
-                        f"  [{pod_name}] ({len(error_lines)} error lines):\n"
-                        + "\n".join(f"    {l[:200]}" for l in error_lines[-5:])
-                    )
-        if wf_log_parts:
-            sections.append(
-                f"## WORKFLOW POD LOGS (error lines only)\n"
-                + "\n".join(wf_log_parts)
-            )
-
-    # ── 9. Pre-extracted verdicts (from our own parser) ──────────────────────
-    verdicts = _parse_verdicts_from_exporter_logs(mcp_data)
-    if verdicts:
-        sections.append(
-            f"## PRE-EXTRACTED VERDICTS (from chaos-exporter regex parse)\n"
-            + json.dumps(verdicts, indent=2)
-        )
-
-    return "\n\n".join(sections)
+    ```
+ 
+    ## CRITICAL RULES
+ 
+    1. TRACE EVERY TOOL CALL: Always include tool names and argument summaries
+       in the tools_used array for each phase.
+    2. TIMESTAMP EVERY PHASE: Use ISO-8601 timestamps so detection and
+       remediation timelines can be calculated.
+    3. NEVER FABRICATE DATA: If you cannot determine a value, use null. Do not
+       invent pod names, metric values, or outcomes.
+    4. SHOW YOUR REASONING: In the DIAGNOSIS phase, explain WHY you concluded
+       what the root cause is. The reasoning chain is scored.
+    5. QUALITY OVER QUANTITY: A well-reasoned sequence of 5 targeted tool calls
+       scores higher than 20 scattered ones.
+    6. REPORT FAILURES HONESTLY: If a remediation step fails, report it as
+       failed. Honesty in failure reporting is valued over hiding errors.
+    7. EVERY PHASE MUST APPEAR: Even if a phase finds nothing, include its JSON
+       block with empty arrays and null values.
+    8. RETURN ONLY JSON: Your final output must be a single valid JSON object.
+       No markdown fences, no preamble, no commentary outside the JSON.
+ 
+  # ---------------------------------------------------------------------------
+  # User-message template — wraps the raw operational data before sending
+  # to the agent. The orchestrator substitutes the placeholders.
+  # ---------------------------------------------------------------------------
+  user_message_template: |
+    Analyze the following Kubernetes environment and perform the full 4-phase
+    fault detection, diagnosis, remediation, and verification protocol.
+ 
+    Target namespace: {namespace}
+    Target deployment: {deployment}
+    Fault context: {fault_context}
+    Session ID: {session_id}
+ 
+    Begin your investigation now. Use the available Kubernetes and Prometheus
+    MCP tools to query the cluster state. Complete all 4 phases and return
+    your structured JSON report.
+ 
+# =============================================================================
+# Legacy / Reference: Original single-shot analysis prompt
+# Kept for backward compatibility with metrics extraction pipeline
+# =============================================================================
+analysis:
+  system_prompt: |
+    You are an expert IT-Operations analyst. Analyse the raw operational data
+    received from a Kubernetes or Prometheus MCP server tool response.
+ 
+    Extract:
+    1. Issues list - for each issue:
+       - severity          (critical | warning | info)
+       - affected_pod      (pod name or "N/A")
+       - affected_container
+       - category          (CrashLoop | OOM | ImagePull | Connectivity | Latency |
+                            ErrorRate | ConfigError | HealthCheck |
+                            ResourcePressure | Other)
+       - summary           (one sentence)
+       - recommended_action (one sentence)
+    2. Health metrics:
+       - total_pods, healthy_pods, unhealthy_pods
+       - error_count, warning_count
+       - overall_health_score (0-100)
+ 
+    Return ONLY valid JSON: {"issues": [...], "health": {...}}"""
 
 
 def agent_request_llm_analysis(
@@ -1828,11 +1357,12 @@ def agent_request_llm_analysis(
       Rule ③ – generation also logged to Langfuse (via Langfuse v4 API)
     Returns parsed analysis dict or None on failure.
     """
-    payload_text = _build_llm_data_payload(mcp_data, server_type)
-
-    # Parse verdicts locally — used ONLY for post-LLM cross-validation, NOT sent to LLM
-    verdicts = _parse_verdicts_from_exporter_logs(mcp_data)
-
+    payload_text = (
+        f"Data source : {server_type.upper()} MCP Tool Response\n"
+        f"Namespace   : {K8S_NAMESPACE}\n"
+        f"Timestamp   : {datetime.now(timezone.utc).isoformat()}\n\n"
+        f"{json.dumps(mcp_data, indent=2)[:12000]}"
+    )
     # Merge system instructions into user message for broad model compatibility
     combined_prompt = (
         f"INSTRUCTIONS:\n{_ANALYSIS_SYSTEM}\n\n"
@@ -1855,14 +1385,7 @@ def agent_request_llm_analysis(
                 name="llm-analysis",
                 as_type="generation",
                 model=MODEL_ALIAS,
-                input={
-                    "prompt": "Chaos experiment analysis",
-                    "data_source": f"{server_type.upper()} MCP Tool Response",
-                    "namespace": K8S_NAMESPACE,
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                    "mcp_data_chars": min(len(json.dumps(mcp_data, indent=2)), 12000),
-                    "mcp_summary": _build_mcp_trace_summary(mcp_data),
-                },
+                input=messages,
             )
         except Exception as exc:
             logger.warning("Langfuse analysis generation init failed: %s", exc)
@@ -1892,37 +1415,11 @@ def agent_request_llm_analysis(
         elif "```" in json_text:
             json_text = json_text.split("```", 1)[1].split("```", 1)[0]
         result = json.loads(json_text.strip())
-
-        # Cross-validate LLM output against real exporter verdicts
-        _cross_validate_llm_with_verdicts(result, verdicts)
-
-        # Log experiment summary if present
-        exp = result.get("experiment_summary", {})
-        faults = result.get("chaos_faults", [])
-        wf_errors = result.get("workflow_errors", [])
         logger.info(
-            "LLM Gateway → Agent: analysis complete | "
-            "workflow=%s phase=%s | faults: %d passed, %d failed | "
-            "workflow_errors=%d | issues=%d | health=%s",
-            exp.get("workflow_name", "N/A"),
-            exp.get("workflow_phase", "N/A"),
-            exp.get("faults_passed", 0),
-            exp.get("faults_failed", 0),
-            len(wf_errors),
+            "LLM Gateway → Agent: analysis complete | health=%s | issues=%d",
+            result.get("health", {}).get("overall_health_score", "?"),
             len(result.get("issues", [])),
-            result.get("health", {}).get("overall_health_score", "N/A"),
         )
-        # Log each fault verdict for visibility
-        for f in faults:
-            v_icon = "\u2705" if f.get("verdict") == "Pass" else "\u274c" if f.get("verdict") == "Fail" else "\u23f3"
-            logger.info(
-                "  %s %s \u2192 %s | probe=%s%% | impact: %s",
-                v_icon,
-                f.get("fault_name", "?"),
-                f.get("verdict", "?"),
-                f.get("probe_success_percentage", "?"),
-                (f.get("impact_observed", "N/A") or "N/A")[:80],
-            )
     except json.JSONDecodeError as exc:
         logger.error("LLM returned invalid JSON: %s", exc)
     except Exception as exc:
@@ -1950,78 +1447,17 @@ def agent_request_llm_analysis(
     # Rule ③: finalise Langfuse generation (v4 API: update then end)
     if lf_generation:
         try:
-            # Build compact output summary for Langfuse trace display
-            trace_output: Dict[str, Any] = {}
-            # Expected top-level keys from our prompt's RETURN FORMAT
-            _EXPECTED_KEYS = {"experiment_summary", "chaos_faults", "workflow_steps", "workflow_errors", "issues", "health"}
-            _CORE_KEYS = {"experiment_summary", "chaos_faults", "workflow_steps"}
-            if result:
-                # Check if LLM followed our schema: need ≥2 expected keys AND at least 1 core chaos key
-                matched_keys = _EXPECTED_KEYS & set(result.keys())
-                has_core = bool(matched_keys & _CORE_KEYS)
-                if has_core and len(matched_keys) >= 2:
-                    # LLM followed our format → build compact summary
-                    trace_output = {
-                        "experiment": result.get("experiment_summary", {}),
-                        "chaos_faults": [
-                            {
-                                "fault": f.get("fault_name"),
-                                "verdict": f.get("verdict"),
-                                "probe_pct": f.get("probe_success_percentage"),
-                                "target": f.get("target_app"),
-                                "impact": (f.get("impact_observed", "") or "")[:120],
-                                "recovery": (f.get("recovery_observed", "") or "")[:120],
-                                "resilience": (f.get("resilience_assessment", "") or "")[:80],
-                            }
-                            for f in result.get("chaos_faults", [])
-                        ],
-                        "workflow_errors": [
-                            {
-                                "workflow": (e.get("workflow_name", "") or "")[-30:],
-                                "step": e.get("error_step"),
-                                "error": (e.get("error_message", "") or "")[:120],
-                                "fix": (e.get("fix_suggestion", "") or "")[:80],
-                            }
-                            for e in result.get("workflow_errors", [])
-                        ],
-                        "issue_count": len(result.get("issues", [])),
-                        "health_score": result.get("health", {}).get("overall_health_score"),
-                    }
-                else:
-                    # LLM returned valid JSON but NOT in our expected format
-                    # Store raw result so we don't lose visibility
-                    logger.warning(
-                        "LLM result missing expected keys (found: %s, expected ≥2 of: %s). "
-                        "Storing raw result in trace.",
-                        list(result.keys())[:10], sorted(_EXPECTED_KEYS),
-                    )
-                    raw_str = json.dumps(result, default=str)
-                    trace_output = {
-                        "_schema_mismatch": True,
-                        "_llm_keys": list(result.keys())[:15],
-                        "_matched_keys": sorted(matched_keys),
-                        "raw_result": raw_str[:3000],
-                    }
-            else:
-                trace_output = {
-                    "error": "LLM returned no valid JSON",
-                    "raw_snippet": (output_text or "")[:500],
-                }
-
             lf_generation.update(
-                output=trace_output,
+                output=output_text,
                 usage_details={
                     "input":  usage.get("prompt_tokens", 0),
                     "output": usage.get("completion_tokens", 0),
                 },
                 metadata={
-                    "has_result":       result is not None,
-                    "schema_matched":   result is not None and bool((_EXPECTED_KEYS & set(result.keys())) & _CORE_KEYS) and len((_EXPECTED_KEYS & set(result.keys())) if result else set()) >= 2,
-                    "result_keys":      list(result.keys())[:10] if result else [],
-                    "issue_count":      len(result.get("issues", [])) if result else 0,
-                    "health_score":     result.get("health", {}).get("overall_health_score") if result else None,
-                    "duration_sec":     round(duration, 3),
-                    "raw_output_snippet": (output_text or "")[:300],
+                    "has_result":   result is not None,
+                    "issue_count":  len(result.get("issues", [])) if result else 0,
+                    "health_score": result.get("health", {}).get("overall_health_score") if result else None,
+                    "duration_sec": round(duration, 3),
                 },
             )
             lf_generation.end()
@@ -2180,39 +1616,8 @@ def _run_scan_steps(
                 # Update root span with final output before context closes
                 duration = time.time() - scan_start
                 health = result.get("health", {}) if isinstance(result, dict) else {}
-                # Build compact scan output for root span
-                scan_output: Dict[str, Any] = {}
-                _ROOT_EXPECTED = {"experiment_summary", "chaos_faults", "workflow_steps", "workflow_errors", "issues", "health"}
-                _ROOT_CORE = {"experiment_summary", "chaos_faults", "workflow_steps"}
-                if isinstance(result, dict):
-                    root_matched = _ROOT_EXPECTED & set(result.keys())
-                    has_root_core = bool(root_matched & _ROOT_CORE)
-                    if has_root_core and len(root_matched) >= 2:
-                        scan_output = {
-                            "experiment": result.get("experiment_summary", {}),
-                            "chaos_faults_summary": [
-                                {
-                                    "fault": f.get("fault_name"),
-                                    "verdict": f.get("verdict"),
-                                    "probe_pct": f.get("probe_success_percentage"),
-                                    "impact": (f.get("impact_observed", "") or "")[:100],
-                                }
-                                for f in result.get("chaos_faults", [])
-                            ],
-                            "workflow_errors_count": len(result.get("workflow_errors", [])),
-                            "issue_count": len(result.get("issues", [])),
-                            "health_score": health.get("overall_health_score"),
-                        }
-                    else:
-                        # LLM didn't follow expected schema — show raw result
-                        raw_str = json.dumps(result, default=str)
-                        scan_output = {
-                            "_schema_mismatch": True,
-                            "_llm_keys": list(result.keys())[:15],
-                            "raw_result": raw_str[:2000],
-                        }
                 root_span.update(
-                    output=scan_output,
+                    output=result,
                     metadata={
                         "duration_sec":    round(duration, 3),
                         "health_score":    health.get("overall_health_score"),
