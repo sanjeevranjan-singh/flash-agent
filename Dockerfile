@@ -26,7 +26,7 @@ RUN chown -R agent:agent /app
 USER agent
 
 # CronJob mode by default (run once). Override SCAN_INTERVAL>0 for continuous.
-ENV SCAN_INTERVAL=0
+ENV SCAN_INTERVAL=120
 ENV LOG_LEVEL=INFO
 
 ENTRYPOINT ["python", "-u", "main.py"]
