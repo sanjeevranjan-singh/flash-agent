@@ -1,25 +1,25 @@
 """
-Flash Agent v3.0.0 – ITOps Kubernetes Log Metrics Agent
+Flash Agent v4.0.0 – ITOps Kubernetes Log Metrics Agent
 ========================================================
 
-Architecture (matches hand-drawn diagram):
+Architecture:
 
-  Tool ──► MCP Server ◄──► Agent ◄──► LLM Gateway ◄──► LLM
-                              │
-              ┌───────────────┼───────────────────┐
-              │               │                   │
-     ① MCP Req+Res     ② LLM Req+Res       ③ OTL Collector
-       saved to            saved in            data flows
-       SEPARATE FILE       OTL Collector       to Langfuse
-       + OTL Collector
+  Tool ──► MCP Server ◄──► Agent ◄──► LLM Gateway (LiteLLM) ◄──► LLM
 
-Storage Rules (per diagram notes):
-  ① (Req, Response) between MCP Server and Agent
-      → stored in a SEPARATE FILE  (mcp_interactions.jsonl)
-      → ALSO stored in OTL Collector
-  ② (Request, Response) between Agent and LLM Gateway
-      → stored in OTL Collector
-  ③ Finally, OTL Collector data goes to Langfuse
+Observability:
+  All LLM calls are routed through the LiteLLM proxy, which handles
+  tracing to Langfuse (via success_callback), retry logic, rate-limiting,
+  and model routing.  The agent itself no longer depends on the Langfuse
+  SDK or OpenTelemetry SDK — those concerns are offloaded to LiteLLM.
+
+  MCP interactions are persisted locally to a JSONL file for audit/replay.
+  Each LLM call includes extra_body.metadata carrying scan context
+  (scan_id, step, namespace, experiment IDs) so that Langfuse traces
+  are automatically enriched by LiteLLM.
+
+Storage Rules:
+  ① MCP Req+Res → saved to SEPARATE FILE (mcp_interactions.jsonl)
+  ② LLM Req+Res → routed through LiteLLM proxy (Langfuse callback)
 """
 
 from __future__ import annotations
@@ -35,27 +35,16 @@ from typing import Any, Dict, List, Optional
 
 import requests
 from openai import AzureOpenAI, OpenAI
-from opentelemetry import trace
-from opentelemetry.sdk.resources import SERVICE_NAME, Resource
-from opentelemetry.sdk.trace import TracerProvider
-from opentelemetry.sdk.trace.export import BatchSpanProcessor
-from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
 
 # Load .env file if present (prefer .env.local for local testing)
 try:
     from dotenv import load_dotenv
-    
+
     # Check if .env.local exists, otherwise use .env
     env_file = ".env.local" if Path(".env.local").exists() else ".env"
     load_dotenv(env_file, override=True)
 except ImportError:
     pass
-
-try:
-    from langfuse import Langfuse
-    _LANGFUSE_AVAILABLE = True
-except ImportError:
-    _LANGFUSE_AVAILABLE = False
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Logging
@@ -85,15 +74,6 @@ K8S_MCP_URL  = os.getenv("K8S_MCP_URL")
 PROM_MCP_URL = os.getenv("PROM_MCP_URL")
 MCP_TIMEOUT  = int(os.getenv("MCP_TIMEOUT", "30"))
 
-# OTL Collector → OTLP endpoint (rule ② and ③ – collector forwards to Langfuse)
-OTEL_EXPORTER_OTLP_ENDPOINT = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "")
-OTEL_EXPORTER_OTLP_HEADERS  = os.getenv("OTEL_EXPORTER_OTLP_HEADERS",  "")
-
-# Langfuse direct client (rule ③ – additional rich metadata path)
-LANGFUSE_PUBLIC_KEY = os.getenv("LANGFUSE_PUBLIC_KEY", "")
-LANGFUSE_SECRET_KEY = os.getenv("LANGFUSE_SECRET_KEY", "")
-LANGFUSE_HOST       = os.getenv("LANGFUSE_HOST", "")
-
 # ① Separate file for MCP Req+Res (JSONL – one record per line)
 MCP_INTERACTIONS_FILE = os.getenv("MCP_INTERACTIONS_FILE")
 
@@ -101,9 +81,8 @@ MCP_INTERACTIONS_FILE = os.getenv("MCP_INTERACTIONS_FILE")
 CHAOS_NAMESPACE = os.getenv("CHAOS_NAMESPACE", "litmus")
 
 # Scan behaviour
-TRACE_TAGS    = [t.strip() for t in os.getenv("TRACE_TAGS", "").split(",") if t.strip()]
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "0"))
-_scan_counter = 0  # incremented each scan for sequencing in Langfuse
+_scan_counter = 0  # incremented each scan for tracking
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Graceful shutdown
@@ -164,153 +143,19 @@ def persist_mcp_interaction_to_file(
         logger.warning("Failed to write MCP interaction file: %s", exc)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# OTL COLLECTOR  –  init + span helpers  (rules ① and ②)
-# The OTL Collector receives both MCP and LLM spans, then forwards to Langfuse.
-# ══════════════════════════════════════════════════════════════════════════════
-
-def init_otl_collector() -> Optional[trace.Tracer]:
-    """
-    Initialise the OpenTelemetry (OTL) Collector OTLP exporter.
-
-    - Rule ①b : MCP Req+Res spans are sent here.
-    - Rule ②  : LLM Req+Res spans are sent here.
-    - Rule ③  : The collector endpoint should be Langfuse OTLP or an OTel
-                Collector that forwards to Langfuse.
-    """
-    if not OTEL_EXPORTER_OTLP_ENDPOINT:
-        logger.info("OTEL_EXPORTER_OTLP_ENDPOINT not set – OTL Collector disabled")
-        return None
-    try:
-        headers: Dict[str, str] = {}
-        if OTEL_EXPORTER_OTLP_HEADERS:
-            for pair in OTEL_EXPORTER_OTLP_HEADERS.split(","):
-                if "=" in pair:
-                    k, v = pair.split("=", 1)
-                    headers[k.strip()] = v.strip()
-
-        resource = Resource.create({
-            SERVICE_NAME:             AGENT_NAME,
-            "service.version":        "3.0.0",
-            "deployment.environment": AGENT_MODE,
-            "k8s.namespace":          K8S_NAMESPACE,
-        })
-        provider = TracerProvider(resource=resource)
-        exporter = OTLPSpanExporter(
-            endpoint=OTEL_EXPORTER_OTLP_ENDPOINT,
-            headers=headers or None,
-        )
-        provider.add_span_processor(BatchSpanProcessor(exporter))
-        trace.set_tracer_provider(provider)
-        tracer = trace.get_tracer(AGENT_NAME)
-        logger.info("OTL Collector initialised → %s", OTEL_EXPORTER_OTLP_ENDPOINT)
-        return tracer
-    except Exception as exc:
-        logger.warning("OTL Collector init failed: %s", exc)
-        return None
-
-
-def _otl_record_mcp_span(
-    tracer: trace.Tracer,
-    server_type: str,
-    request_payload: Dict[str, Any],
-    response_payload: Dict[str, Any],
-    duration_sec: float,
-    scan_id: str,
-) -> None:
-    """
-    Rule ①b – Store MCP Req+Res in OTL Collector as a span
-    (in addition to the separate file written by rule ①a).
-    """
-    with tracer.start_as_current_span(
-        "mcp-interaction",
-        attributes={
-            "scan.id":          scan_id,
-            "mcp.server_type":  server_type,
-            "mcp.url":          K8S_MCP_URL if server_type == "kubernetes" else PROM_MCP_URL,
-            "k8s.namespace":    K8S_NAMESPACE,
-            "mcp.duration_sec": round(duration_sec, 3),
-            "mcp.has_error":    "error" in response_payload,
-            "mcp.request":      json.dumps(request_payload)[:1024],
-            "mcp.response":     json.dumps(response_payload)[:2048],
-        },
-    ):
-        pass
-    logger.info("① MCP Req+Res also recorded in OTL Collector (rule ①b)")
-
-
-def _otl_record_llm_span(
-    tracer: trace.Tracer,
-    span_name: str,
-    messages_in: List[Dict[str, str]],
-    response_text: str,
-    usage: Dict[str, int],
-    duration_sec: float,
-    scan_id: str,
-    extra_attrs: Optional[Dict[str, Any]] = None,
-) -> None:
-    """
-    Rule ② – Store Agent ↔ LLM Gateway (Req+Res) in OTL Collector as a span.
-    """
-    attrs: Dict[str, Any] = {
-        "scan.id":               scan_id,
-        "llm.span_name":         span_name,
-        "llm.model":             MODEL_ALIAS,
-        "llm.gateway_url":       OPENAI_BASE_URL,
-        "llm.duration_sec":      round(duration_sec, 3),
-        "llm.prompt_tokens":     usage.get("prompt_tokens",     0),
-        "llm.completion_tokens": usage.get("completion_tokens", 0),
-        "llm.request":           json.dumps(messages_in)[:2048],
-        "llm.response":          response_text[:2048],
-    }
-    if extra_attrs:
-        attrs.update(extra_attrs)
-
-    with tracer.start_as_current_span(span_name, attributes=attrs):
-        pass
-    logger.info("② LLM Req+Res (%s) recorded in OTL Collector (rule ②)", span_name)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# RULE ③  –  LANGFUSE CLIENT
-# OTL Collector forwards spans to Langfuse via OTLP.
-# This direct client is an additional path for richer metadata / scores.
-# ══════════════════════════════════════════════════════════════════════════════
-
-def _build_langfuse_client() -> Optional["Langfuse"]:
-    """
-    Rule ③: OTL Collector data goes to Langfuse.
-    The OTLP exporter already forwards all spans when the endpoint is set to
-    Langfuse's OTLP URL.  This SDK client adds cost tracking, scores, and
-    richer generation metadata on top of the OTLP path.
-    """
-    if not _LANGFUSE_AVAILABLE:
-        logger.warning("langfuse package not installed – direct Langfuse client disabled")
-        return None
-    if not (LANGFUSE_PUBLIC_KEY and LANGFUSE_SECRET_KEY):
-        logger.info(
-            "Langfuse credentials not set – direct SDK client disabled "
-            "(OTLP → Langfuse path still active if endpoint is configured)"
-        )
-        return None
-    try:
-        lf = Langfuse(
-            public_key=LANGFUSE_PUBLIC_KEY,
-            secret_key=LANGFUSE_SECRET_KEY,
-            host=LANGFUSE_HOST,
-        )
-        logger.info("③ Langfuse direct client initialised (host=%s)", LANGFUSE_HOST)
-        return lf
-    except Exception as exc:
-        logger.warning("Langfuse direct client init failed: %s", exc)
-        return None
-
-
 # ──────────────────────────────────────────────────────────────────────────────
-# OpenAI / LLM Gateway client
+# OpenAI / LLM Gateway client (routed through LiteLLM proxy)
+# LiteLLM handles Langfuse tracing via success_callback — no SDK needed here.
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _openai_client() -> OpenAI:
+    """
+    Create an OpenAI-compatible client pointing to the LiteLLM proxy.
+
+    When OPENAI_BASE_URL points to an Azure endpoint (.openai.azure.com),
+    we use AzureOpenAI for direct Azure calls.  Otherwise we use the
+    standard OpenAI client, typically pointed at the LiteLLM proxy URL.
+    """
     # Azure OpenAI endpoints require the AzureOpenAI client
     if OPENAI_BASE_URL and ".openai.azure.com" in OPENAI_BASE_URL:
         return AzureOpenAI(
@@ -328,7 +173,7 @@ def _openai_client() -> OpenAI:
 
 # ══════════════════════════════════════════════════════════════════════════════
 # STEP 1  –  Agent → LLM Gateway: select the MCP tool
-# Stores LLM Req+Res in OTL Collector (rule ②) and Langfuse (rule ③)
+# LLM call routed through LiteLLM; Langfuse trace via success_callback.
 # ══════════════════════════════════════════════════════════════════════════════
 
 _TOOL_SELECTION_SYSTEM = """\
@@ -345,16 +190,15 @@ Reply with EXACTLY one word: kubernetes  OR  prometheus.  No explanation."""
 
 def agent_request_tool_selection(
     user_query: str,
-    otl_tracer: Optional[trace.Tracer],
-    langfuse_client: Optional["Langfuse"] = None,
     scan_id: str = "",
 ) -> str:
     """
-    Agent → LLM Gateway: ask which MCP tool to use for this scan query.
+    Agent → LLM Gateway (via LiteLLM): ask which MCP tool to use.
 
-    Storage:
-      Rule ② – LLM Req+Res span → OTL Collector
-      Rule ③ – generation also logged to Langfuse (via Langfuse v4 API)
+    The LLM call goes through LiteLLM proxy which automatically records
+    the request/response in Langfuse via its success_callback.
+    extra_body.metadata carries scan context for trace correlation.
+
     Returns 'kubernetes' or 'prometheus'.
     """
     messages: List[Dict[str, str]] = [
@@ -362,25 +206,12 @@ def agent_request_tool_selection(
     ]
     logger.info("Agent → LLM Gateway: requesting tool selection …")
 
-    # Langfuse direct generation (rule ③) – Langfuse v4 API
-    lf_generation = None
-    if langfuse_client:
-        try:
-            lf_generation = langfuse_client.start_observation(
-                name="llm-tool-selection",
-                as_type="generation",
-                model=MODEL_ALIAS,
-                input=messages,
-            )
-        except Exception as exc:
-            logger.warning("Langfuse generation init failed: %s", exc)
-
     decision    = "kubernetes"
     output_text = ""
-    usage: Dict[str, int] = {}
     t0 = time.time()
 
     try:
+        # LLM call routed through LiteLLM — Langfuse tracing is automatic
         resp = _openai_client().chat.completions.create(
             model=MODEL_ALIAS,
             messages=messages,
@@ -402,10 +233,6 @@ def agent_request_tool_selection(
         # Some models (reasoning) return content=None; fall back to reasoning_content
         raw_text = msg.content or getattr(msg, "reasoning_content", None) or ""
         output_text = raw_text.strip().lower()
-        usage = {
-            "prompt_tokens":     resp.usage.prompt_tokens     if resp.usage else 0,
-            "completion_tokens": resp.usage.completion_tokens if resp.usage else 0,
-        }
         decision = "prometheus" if "prometheus" in output_text else "kubernetes"
         logger.info("LLM Gateway → Agent: tool decision = %s (raw=%r)", decision, output_text)
 
@@ -413,34 +240,7 @@ def agent_request_tool_selection(
         logger.error("LLM tool-selection failed: %s – defaulting to kubernetes", exc)
 
     duration = time.time() - t0
-
-    # Rule ②: LLM Req+Res → OTL Collector
-    if otl_tracer:
-        _otl_record_llm_span(
-            tracer=otl_tracer,
-            span_name="llm-tool-selection",
-            messages_in=messages,
-            response_text=output_text or decision,
-            usage=usage,
-            duration_sec=duration,
-            scan_id=scan_id,
-            extra_attrs={"llm.decision": decision},
-        )
-
-    # Rule ③: finalise Langfuse generation (v4 API: update then end)
-    if lf_generation:
-        try:
-            lf_generation.update(
-                output=output_text or decision,
-                usage_details={
-                    "input":  usage.get("prompt_tokens", 0),
-                    "output": usage.get("completion_tokens", 0),
-                },
-                metadata={"decision": decision, "duration_sec": round(duration, 3)},
-            )
-            lf_generation.end()
-        except Exception as exc:
-            logger.warning("Langfuse generation.end failed: %s", exc)
+    logger.info("Tool selection completed in %.2fs → %s", duration, decision)
 
     return decision
 
@@ -520,7 +320,7 @@ def generate_mcp_fallback_data(server_type, query):
 
 # ══════════════════════════════════════════════════════════════════════════════
 # STEP 2  –  Agent → MCP Server: call the selected tool, get Tool Response
-# Stores MCP Req+Res in SEPARATE FILE (rule ①a) AND OTL Collector (rule ①b)
+# MCP Req+Res stored in SEPARATE FILE (rule ①)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _mcp_jsonrpc_call(
@@ -636,11 +436,12 @@ def _extract_active_pod_names(
     return pod_names
 
 
-def _build_mcp_trace_summary(response_payload: Dict[str, Any]) -> Dict[str, Any]:
+def _build_mcp_data_summary(response_payload: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Build a compact but meaningful summary of MCP response data for Langfuse traces.
-    Extracts key operational signals instead of dumping raw text.
-    This is ONLY for trace display — does NOT affect what flows to the LLM.
+    Build a compact structured summary of the MCP response data.
+
+    Used by _build_llm_data_payload() to extract pod status, events,
+    workflow metadata and chaos results for the LLM analysis prompt.
     """
     import re as _re
 
@@ -826,8 +627,6 @@ def _build_mcp_trace_summary(response_payload: Dict[str, Any]) -> Dict[str, Any]
 def agent_call_mcp_server(
     server_type: str,
     query: str,
-    otl_tracer: Optional[trace.Tracer],
-    langfuse_client: Optional["Langfuse"] = None,
     scan_id: str = "",
 ) -> Dict[str, Any]:
     """
@@ -835,9 +634,7 @@ def agent_call_mcp_server(
     Uses MCP JSON-RPC 2.0 Streamable HTTP protocol.
 
     Storage:
-      Rule ①a – Req+Res → separate JSONL file  (mcp_interactions.jsonl)
-      Rule ①b – Req+Res → OTL Collector span
-      Rule ③  – Langfuse span (via Langfuse v4 API)
+      Rule ① – Req+Res → separate JSONL file  (mcp_interactions.jsonl)
     """
     if server_type not in ("kubernetes", "prometheus"):
         raise ValueError(f"Unknown MCP server: {server_type!r}")
@@ -1023,7 +820,7 @@ def agent_call_mcp_server(
 
     duration = time.time() - t0
 
-    # Rule ①a: save to SEPARATE FILE
+    # Rule ①: save MCP interaction to SEPARATE FILE for audit/replay
     persist_mcp_interaction_to_file(
         server_type=server_type,
         request_payload=request_payload,
@@ -1031,61 +828,6 @@ def agent_call_mcp_server(
         duration_sec=duration,
         scan_id=scan_id,
     )
-
-    # Rule ①b: also save to OTL Collector
-    if otl_tracer:
-        _otl_record_mcp_span(
-            tracer=otl_tracer,
-            server_type=server_type,
-            request_payload=request_payload,
-            response_payload=response_payload,
-            duration_sec=duration,
-            scan_id=scan_id,
-        )
-
-    # Rule ③: Langfuse MCP span (v4 API: start_observation + update + end)
-    if langfuse_client:
-        try:
-            mcp_span = langfuse_client.start_observation(
-                name=f"mcp-{server_type}-request",
-                as_type="span",
-                input={
-                    "server": server_type,
-                    "namespace": K8S_NAMESPACE,
-                    "tools": [rk for _, _, rk in tool_calls],
-                },
-            )
-            # Build compact meaningful summary for trace (full data still goes to LLM)
-            trace_output = _build_mcp_trace_summary(response_payload)
-            # Inject experiment_info into MCP span output only (not LLM input)
-            # workflow_ids lives under response_payload["data"]["workflow_ids"]
-            _rp_data = response_payload.get("data", response_payload)
-            wf_ids = _rp_data.get("workflow_ids", {})
-            exp_id_val = wf_ids.get("workflow_id", "") if wf_ids else ""
-            exp_run_id_val = wf_ids.get("workflow_run_id", "") if wf_ids else ""
-            if wf_ids:
-                trace_output["experiment_info"] = {
-                    "experiment_id":     exp_id_val,
-                    "experiment_run_id": exp_run_id_val,
-                    "revision_id":      wf_ids.get("revision_id", ""),
-                    "infra_id":         wf_ids.get("infra_id", ""),
-                    "subject":          wf_ids.get("subject", ""),
-                }
-            mcp_span.update(
-                output=trace_output,
-                metadata={
-                    "server_type":  server_type,
-                    "url":          url,
-                    "duration_sec": round(duration, 3),
-                    "has_error":    "error" in response_payload,
-                    "experiment_id":     exp_id_val,
-                    "experiment_run_id": exp_run_id_val,
-                },
-            )
-            mcp_span.end()
-            logger.info("③ MCP Langfuse span recorded for %s", server_type)
-        except Exception as exc:
-            logger.warning("Langfuse MCP span failed: %s", exc)
 
     return response_payload
 
@@ -1508,167 +1250,9 @@ def _cross_validate_llm_with_verdicts(
     )
 
 
-def _record_workflow_step_spans(
-    langfuse_client: "Langfuse",
-    mcp_data: Dict[str, Any],
-    llm_analysis: Optional[Dict[str, Any]],
-    scan_id: str,
-) -> None:
-    """
-    Create individual Langfuse child spans for each expected workflow step.
-    Uses:
-      - EXPECTED_WORKFLOW_STEPS (known from workflow YAML)
-      - chaos-exporter logs for REAL per-fault verdicts
-      - argo_workflows text table for overall workflow phase
-      - LLM chaos_faults for supplementary descriptions
-    """
-    if not langfuse_client:
-        return
-
-    # 1. Parse real verdicts from chaos-exporter logs
-    verdicts = _parse_verdicts_from_exporter_logs(mcp_data)
-
-    # 2. Parse workflow-level phase from argo text table and pick LATEST by epoch
-    wf_phases = _parse_workflow_phase_from_text(mcp_data.get("argo_workflows", {}))
-    latest_wf_name, latest_wf_phase = _get_latest_workflow(wf_phases)
-
-    # 2b. Extract experiment IDs from Phase 3 data
-    workflow_ids = mcp_data.get("workflow_ids", {})
-    experiment_id = workflow_ids.get("workflow_id", "")
-    experiment_run_id = workflow_ids.get("workflow_run_id", "")
-
-    # 3. Build lookup from LLM chaos_faults for impact/recovery descriptions
-    llm_faults: Dict[str, Dict] = {}
-    if llm_analysis:
-        for cf in llm_analysis.get("chaos_faults", []):
-            fname = cf.get("fault_name", "") or cf.get("step_name", "")
-            if fname:
-                llm_faults[fname] = cf
-
-    # 4. Build lookup from LLM workflow_steps for non-chaos step status
-    llm_steps: Dict[str, Dict] = {}
-    if llm_analysis:
-        for ws in llm_analysis.get("workflow_steps", []):
-            sname = ws.get("step_name", "")
-            if sname:
-                llm_steps[sname] = ws
-
-    created = 0
-    for i, step_name in enumerate(EXPECTED_WORKFLOW_STEPS):
-        is_chaos = step_name in CHAOS_STEP_METADATA
-
-        if is_chaos:
-            meta = CHAOS_STEP_METADATA[step_name]
-            real = verdicts.get(meta["fault_type"], {})
-            real_verdict = real.get("verdict", "N/A")
-            probe_pct = real.get("probe_success_pct", "N/A")
-            llm_fault = llm_faults.get(step_name, {})
-
-            if real_verdict == "Pass":
-                icon = "\u2705"
-            elif real_verdict == "Fail":
-                icon = "\u274c"
-            elif real_verdict == "Awaited":
-                icon = "\U0001f525"
-            else:
-                icon = "\u2b1c"
-
-            display = (
-                f"{icon} Step {i+1}: {step_name} \u2192 "
-                f"{meta['target_kind']}/{meta['target_app']} [{real_verdict}]"
-            )
-
-            span_input: Dict[str, Any] = {
-                "step_number": i + 1,
-                "step_name": step_name,
-                "fault_type": meta["fault_type"],
-                "target": f"{meta['target_kind']}/{meta['target_app']}",
-                "target_namespace": meta["target_ns"],
-                "duration_config": f"{meta['duration']}s",
-                "probe": meta["probe"],
-                "probe_mode": meta["probe_mode"],
-                "params": meta.get("params", {}),
-            }
-
-            span_output: Dict[str, Any] = {
-                "experiment_id": experiment_id,
-                "experiment_run_id": experiment_run_id,
-                "verdict_source": "chaos-exporter logs (real)",
-                "verdict": real_verdict,
-                "probe_success_percentage": probe_pct,
-                "chaos_duration_sec": llm_fault.get("chaos_duration_sec", "N/A"),
-                "impact_observed": llm_fault.get("impact_observed", "N/A"),
-                "recovery_observed": llm_fault.get("recovery_observed", "N/A"),
-                "resilience_assessment": llm_fault.get("resilience_assessment", "N/A"),
-                "llm_verdict": llm_fault.get("verdict", "N/A"),
-                "llm_probe_pct": llm_fault.get("probe_success_percentage", "N/A"),
-            }
-            level = "WARNING" if real_verdict == "Fail" else "DEFAULT"
-
-        else:
-            llm_step = llm_steps.get(step_name, {})
-            llm_status = llm_step.get("status", "")
-
-            if llm_status in ("Succeeded", "Completed"):
-                icon = "\u2705"
-                phase = "Succeeded"
-            elif llm_status == "Failed":
-                icon = "\u274c"
-                phase = "Failed"
-            elif latest_wf_phase in ("Succeeded", "Running"):
-                icon = "\u2705"
-                phase = "Succeeded"
-            elif latest_wf_phase == "Failed":
-                icon = "\u26a0\ufe0f"
-                phase = "Unknown (workflow failed)"
-            else:
-                icon = "\u2b1c"
-                phase = latest_wf_phase
-
-            display = f"{icon} Step {i+1}: {step_name}"
-            span_input = {
-                "step_number": i + 1,
-                "step_name": step_name,
-                "type": "infrastructure",
-            }
-            span_output = {
-                "experiment_id": experiment_id,
-                "experiment_run_id": experiment_run_id,
-                "phase": phase,
-                "workflow": latest_wf_name,
-                "details": llm_step.get("details", "N/A"),
-            }
-            level = "WARNING" if phase == "Failed" else "DEFAULT"
-
-        try:
-            step_span = langfuse_client.start_observation(
-                name=display,
-                as_type="span",
-                input=span_input,
-                level=level,
-                metadata={
-                    "scan_id": scan_id,
-                    "step_index": i,
-                    "is_chaos_fault": is_chaos,
-                    "workflow": latest_wf_name or "unknown",
-                    "experiment_id": experiment_id,
-                    "experiment_run_id": experiment_run_id,
-                },
-            )
-            step_span.update(output=span_output)
-            step_span.end()
-            created += 1
-        except Exception as exc:
-            logger.warning("Failed to record Langfuse span for step %s: %s",
-                           step_name, exc)
-
-    logger.info("Recorded %d/%d workflow step spans in Langfuse",
-                created, len(EXPECTED_WORKFLOW_STEPS))
-
-
 # ══════════════════════════════════════════════════════════════════════════════
 # STEP 3  –  Agent → LLM Gateway: deep analysis of Tool Response from MCP
-# Stores LLM Req+Res in OTL Collector (rule ②) and Langfuse (rule ③)
+# LLM call routed through LiteLLM; Langfuse trace via success_callback.
 # ══════════════════════════════════════════════════════════════════════════════
 
 _ANALYSIS_SYSTEM = """\
@@ -1866,7 +1450,7 @@ def _build_llm_data_payload(mcp_data: Dict[str, Any], server_type: str) -> str:
     )
 
     # ── 1. Pod status summary (compact) ──────────────────────────────────────
-    summary = _build_mcp_trace_summary(mcp_data)
+    summary = _build_mcp_data_summary(mcp_data)
     pods = summary.get("pods", {})
     if pods:
         sections.append(
@@ -1984,16 +1568,15 @@ def _build_llm_data_payload(mcp_data: Dict[str, Any], server_type: str) -> str:
 def agent_request_llm_analysis(
     mcp_data: Dict[str, Any],
     server_type: str,
-    otl_tracer: Optional[trace.Tracer],
-    langfuse_client: Optional["Langfuse"] = None,
     scan_id: str = "",
 ) -> Optional[Dict[str, Any]]:
     """
-    Agent → LLM Gateway: send the Tool Response from MCP for deep analysis.
+    Agent → LLM Gateway (via LiteLLM): send MCP data for deep analysis.
 
-    Storage:
-      Rule ② – LLM Req+Res span → OTL Collector
-      Rule ③ – generation also logged to Langfuse (via Langfuse v4 API)
+    The LLM call goes through LiteLLM proxy which automatically records
+    the request/response in Langfuse via its success_callback.
+    extra_body.metadata carries scan context for trace correlation.
+
     Returns parsed analysis dict or None on failure.
     """
     payload_text = _build_llm_data_payload(mcp_data, server_type)
@@ -2015,29 +1598,8 @@ def agent_request_llm_analysis(
         server_type, len(combined_prompt),
     )
 
-    # Langfuse direct generation (rule ③) – Langfuse v4 API
-    lf_generation = None
-    if langfuse_client:
-        try:
-            lf_generation = langfuse_client.start_observation(
-                name="llm-analysis",
-                as_type="generation",
-                model=MODEL_ALIAS,
-                input={
-                    "prompt": "Chaos experiment analysis",
-                    "data_source": f"{server_type.upper()} MCP Tool Response",
-                    "namespace": K8S_NAMESPACE,
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                    "mcp_data_chars": min(len(json.dumps(mcp_data, indent=2)), 12000),
-                    "mcp_summary": _build_mcp_trace_summary(mcp_data),
-                },
-            )
-        except Exception as exc:
-            logger.warning("Langfuse analysis generation init failed: %s", exc)
-
     result:      Optional[Dict[str, Any]] = None
     output_text: str = ""
-    usage: Dict[str, int] = {}
     t0 = time.time()
 
     # Extract experiment IDs from MCP Phase 3 data (already fetched)
@@ -2045,6 +1607,7 @@ def agent_request_llm_analysis(
     _wf_ids = _mcp_inner.get("workflow_ids", {}) if isinstance(_mcp_inner, dict) else {}
 
     try:
+        # LLM call routed through LiteLLM — Langfuse tracing is automatic
         resp = _openai_client().chat.completions.create(
             model=MODEL_ALIAS,
             messages=messages,
@@ -2112,201 +1675,26 @@ def agent_request_llm_analysis(
         logger.error("LLM analysis call failed: %s", exc)
 
     duration = time.time() - t0
-
-    # Rule ②: LLM Req+Res → OTL Collector
-    if otl_tracer:
-        _otl_record_llm_span(
-            tracer=otl_tracer,
-            span_name="llm-analysis",
-            messages_in=messages,
-            response_text=output_text,
-            usage=usage,
-            duration_sec=duration,
-            scan_id=scan_id,
-            extra_attrs={
-                "llm.has_result":   result is not None,
-                "llm.issue_count":  len(result.get("issues", [])) if result else 0,
-                "llm.health_score": result.get("health", {}).get("overall_health_score", -1) if result else -1,
-            },
-        )
-
-    # Rule ③: finalise Langfuse generation (v4 API: update then end)
-    if lf_generation:
-        try:
-            # Build compact output summary for Langfuse trace display
-            trace_output: Dict[str, Any] = {}
-            # Expected top-level keys from our prompt's RETURN FORMAT
-            _EXPECTED_KEYS = {"experiment_summary", "chaos_faults", "workflow_steps", "workflow_errors", "issues", "health"}
-            _CORE_KEYS = {"experiment_summary", "chaos_faults", "workflow_steps"}
-            if result:
-                # Check if LLM followed our schema: need ≥2 expected keys AND at least 1 core chaos key
-                matched_keys = _EXPECTED_KEYS & set(result.keys())
-                has_core = bool(matched_keys & _CORE_KEYS)
-                if has_core and len(matched_keys) >= 2:
-                    # LLM followed our format → build compact summary
-                    trace_output = {
-                        "experiment": result.get("experiment_summary", {}),
-                        "chaos_faults": [
-                            {
-                                "fault": f.get("fault_name"),
-                                "verdict": f.get("verdict"),
-                                "probe_pct": f.get("probe_success_percentage"),
-                                "target": f.get("target_app"),
-                                "impact": (f.get("impact_observed", "") or "")[:120],
-                                "recovery": (f.get("recovery_observed", "") or "")[:120],
-                                "resilience": (f.get("resilience_assessment", "") or "")[:80],
-                            }
-                            for f in result.get("chaos_faults", [])
-                        ],
-                        "workflow_errors": [
-                            {
-                                "workflow": (e.get("workflow_name", "") or "")[-30:],
-                                "step": e.get("error_step"),
-                                "error": (e.get("error_message", "") or "")[:120],
-                                "fix": (e.get("fix_suggestion", "") or "")[:80],
-                            }
-                            for e in result.get("workflow_errors", [])
-                        ],
-                        "issue_count": len(result.get("issues", [])),
-                        "health_score": result.get("health", {}).get("overall_health_score"),
-                    }
-                else:
-                    # LLM returned valid JSON but NOT in our expected format
-                    # Store raw result so we don't lose visibility
-                    logger.warning(
-                        "LLM result missing expected keys (found: %s, expected ≥2 of: %s). "
-                        "Storing raw result in trace.",
-                        list(result.keys())[:10], sorted(_EXPECTED_KEYS),
-                    )
-                    raw_str = json.dumps(result, default=str)
-                    trace_output = {
-                        "_schema_mismatch": True,
-                        "_llm_keys": list(result.keys())[:15],
-                        "_matched_keys": sorted(matched_keys),
-                        "raw_result": raw_str[:3000],
-                    }
-            else:
-                trace_output = {
-                    "error": "LLM returned no valid JSON",
-                    "raw_snippet": (output_text or "")[:500],
-                }
-
-            # Inject experiment_info into LLM analysis output (from mcp_data)
-            _llm_mcp_data = mcp_data.get("data", mcp_data) if isinstance(mcp_data, dict) else {}
-            _llm_wf_ids = _llm_mcp_data.get("workflow_ids", {}) if isinstance(_llm_mcp_data, dict) else {}
-            _llm_exp_id = _llm_wf_ids.get("workflow_id", "") if _llm_wf_ids else ""
-            _llm_exp_run_id = _llm_wf_ids.get("workflow_run_id", "") if _llm_wf_ids else ""
-            if _llm_exp_id or _llm_exp_run_id:
-                trace_output["experiment_id"] = _llm_exp_id
-                trace_output["experiment_run_id"] = _llm_exp_run_id
-
-            lf_generation.update(
-                output=trace_output,
-                usage_details={
-                    "input":  usage.get("prompt_tokens", 0),
-                    "output": usage.get("completion_tokens", 0),
-                },
-                metadata={
-                    "has_result":       result is not None,
-                    "schema_matched":   result is not None and bool((_EXPECTED_KEYS & set(result.keys())) & _CORE_KEYS) and len((_EXPECTED_KEYS & set(result.keys())) if result else set()) >= 2,
-                    "result_keys":      list(result.keys())[:10] if result else [],
-                    "issue_count":      len(result.get("issues", [])) if result else 0,
-                    "health_score":     result.get("health", {}).get("overall_health_score") if result else None,
-                    "duration_sec":     round(duration, 3),
-                    "raw_output_snippet": (output_text or "")[:300],
-                    "experiment_id":     _llm_exp_id,
-                    "experiment_run_id": _llm_exp_run_id,
-                },
-            )
-            lf_generation.end()
-        except Exception as exc:
-            logger.warning("Langfuse analysis generation.end failed: %s", exc)
+    logger.info("LLM analysis completed in %.2fs", duration)
 
     return result
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# STEP 4  –  OTL Collector: emit root scan span
-# Ties together the child spans already recorded under rules ① and ②.
-# The collector forwards everything to Langfuse (rule ③).
-# ══════════════════════════════════════════════════════════════════════════════
-
-def otl_emit_root_scan_span(
-    tracer: trace.Tracer,
-    analysis: Dict[str, Any],
-    server_type: str,
-    duration_sec: float,
-    scan_id: str,
-) -> None:
-    """
-    Emit a root 'agent-scan' span in the OTL Collector that wraps the full
-    cycle.  Child spans (mcp-interaction, llm-tool-selection, llm-analysis)
-    were emitted individually during the cycle.
-    The OTLP BatchSpanProcessor forwards all spans to Langfuse (rule ③).
-    """
-    health = analysis.get("health", {})
-    issues = analysis.get("issues", [])
-
-    with tracer.start_as_current_span(
-        "agent-scan",
-        attributes={
-            "scan.id":              scan_id,
-            "agent.name":           AGENT_NAME,
-            "k8s.namespace":        K8S_NAMESPACE,
-            "mcp.server_type":      server_type,
-            "scan.duration_sec":    round(duration_sec, 2),
-            "health.score":         health.get("overall_health_score", -1),
-            "health.total_pods":    health.get("total_pods",           0),
-            "health.healthy_pods":  health.get("healthy_pods",         0),
-            "health.error_count":   health.get("error_count",          0),
-            "health.warning_count": health.get("warning_count",        0),
-            "issue.count":          len(issues),
-            "tags":                 ",".join(TRACE_TAGS),
-        },
-    ) as root_span:
-        for idx, issue in enumerate(issues):
-            root_span.add_event(
-                f"issue-{idx}",
-                attributes={
-                    "severity":           issue.get("severity",           "unknown"),
-                    "affected_pod":       issue.get("affected_pod",       "unknown"),
-                    "affected_container": issue.get("affected_container", "unknown"),
-                    "category":           issue.get("category",           "Other"),
-                    "summary":            issue.get("summary",            ""),
-                    "recommended_action": issue.get("recommended_action", ""),
-                },
-            )
-
-    logger.info(
-        "③ OTL Collector root span emitted → forwarding to Langfuse | "
-        "health=%s | issues=%d",
-        health.get("overall_health_score", "N/A"),
-        len(issues),
-    )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Main agent workflow
 # ══════════════════════════════════════════════════════════════════════════════
 
-def agent_workflow(
-    scan_query: str,
-    otl_tracer: Optional[trace.Tracer],
-    langfuse_client: Optional["Langfuse"],
-) -> Dict[str, Any]:
+def agent_workflow(scan_query: str) -> Dict[str, Any]:
     """
-    Full agentic cycle – mirrors the hand-drawn diagram exactly:
+    Full agentic scan cycle:
 
-      Agent Request tool  ──►  MCP Server  ──►  Tool Response from MCP
-                                                        │
-      Agent Req from Agent  ──►  LLM Gateway  ──►  LLM
-                                                        │
-                 ┌──────────────────────────────────────┘
-                 │
-         OTL Collector  (rules ① + ②)
-                 │
-                 ▼
-            Langfuse  (rule ③)
+      1. Agent → LLM Gateway (tool selection)
+      2. Agent → MCP Server (fetch data)
+      3. Agent → LLM Gateway (deep analysis)
+
+    All LLM calls go through LiteLLM proxy which handles Langfuse tracing
+    automatically via success_callback.  MCP interactions are persisted
+    to a JSONL file (rule ①).
     """
     global _scan_counter
     _scan_counter += 1
@@ -2317,189 +1705,58 @@ def agent_workflow(
     )
     logger.info("═══ Scan #%d started | scan_id=%s ═══", _scan_counter, scan_id)
 
-    # ── Run entire scan inside a Langfuse root span (v4 API) ─────────────────
-    #    All steps (LLM + MCP) attach as children of this one root span.
-    analysis = _run_scan_steps(
+    analysis = _execute_scan_steps(
         scan_query=scan_query,
         scan_id=scan_id,
         scan_start=scan_start,
-        otl_tracer=otl_tracer,
-        langfuse_client=langfuse_client,
     )
 
     return analysis
-
-
-def _run_scan_steps(
-    scan_query: str,
-    scan_id: str,
-    scan_start: float,
-    otl_tracer: Optional[trace.Tracer],
-    langfuse_client: Optional["Langfuse"],
-) -> Dict[str, Any]:
-    """Execute all scan steps, optionally inside a Langfuse root span."""
-
-    if langfuse_client:
-        try:
-            # Use deterministic trace_id from scan_id for correlation
-            trace_id = Langfuse.create_trace_id(seed=scan_id)
-            session_id = f"{AGENT_NAME}-{K8S_NAMESPACE}"
-
-            # Open root span (v4 API – no .trace() method)
-            with langfuse_client.start_as_current_observation(
-                name=f"agent-scan ({scan_id[-8:]})",
-                as_type="span",
-                trace_context={"trace_id": trace_id},
-                input={"scan_query": scan_query, "scan_id": scan_id},
-                metadata={
-                    "agent":            AGENT_NAME,
-                    "namespace":        K8S_NAMESPACE,
-                    "chaos_namespace":  CHAOS_NAMESPACE,
-                    "session_id":       session_id,
-                    "scan_number":      _scan_counter,
-                    "scan_interval":    SCAN_INTERVAL,
-                    "scan_mode":        "continuous" if SCAN_INTERVAL > 0 else "cronjob",
-                    "tags":             [AGENT_NAME, K8S_NAMESPACE, f"scan-{_scan_counter}"] + TRACE_TAGS,
-                },
-            ) as root_span:
-                logger.info("③ Langfuse root span created | trace_id=%s | session=%s | scan=#%d",
-                            trace_id, session_id, _scan_counter)
-                result = _execute_scan_steps(
-                    scan_query=scan_query,
-                    scan_id=scan_id,
-                    scan_start=scan_start,
-                    otl_tracer=otl_tracer,
-                    langfuse_client=langfuse_client,
-                )
-                # Update root span with final output before context closes
-                duration = time.time() - scan_start
-                health = result.get("health", {}) if isinstance(result, dict) else {}
-                # Build compact scan output for root span
-                scan_output: Dict[str, Any] = {}
-                _ROOT_EXPECTED = {"experiment_summary", "chaos_faults", "workflow_steps", "workflow_errors", "issues", "health"}
-                _ROOT_CORE = {"experiment_summary", "chaos_faults", "workflow_steps"}
-                if isinstance(result, dict):
-                    root_matched = _ROOT_EXPECTED & set(result.keys())
-                    has_root_core = bool(root_matched & _ROOT_CORE)
-                    if has_root_core and len(root_matched) >= 2:
-                        scan_output = {
-                            "experiment": result.get("experiment_summary", {}),
-                            "experiment_info": result.get("experiment_info", {}),
-                            "chaos_faults_summary": [
-                                {
-                                    "fault": f.get("fault_name"),
-                                    "verdict": f.get("verdict"),
-                                    "probe_pct": f.get("probe_success_percentage"),
-                                    "impact": (f.get("impact_observed", "") or "")[:100],
-                                }
-                                for f in result.get("chaos_faults", [])
-                            ],
-                            "workflow_errors_count": len(result.get("workflow_errors", [])),
-                            "issue_count": len(result.get("issues", [])),
-                            "health_score": health.get("overall_health_score"),
-                        }
-                    else:
-                        # LLM didn't follow expected schema — show raw result
-                        raw_str = json.dumps(result, default=str)
-                        scan_output = {
-                            "_schema_mismatch": True,
-                            "_llm_keys": list(result.keys())[:15],
-                            "raw_result": raw_str[:2000],
-                        }
-                root_span.update(
-                    output=scan_output,
-                    metadata={
-                        "duration_sec":       round(duration, 3),
-                        "health_score":       health.get("overall_health_score"),
-                        "issue_count":        len(result.get("issues", [])) if isinstance(result, dict) else 0,
-                        "scan_number":        _scan_counter,
-                        "experiment_id":      result.get("experiment_info", {}).get("experiment_id", "") if isinstance(result, dict) else "",
-                        "experiment_run_id":  result.get("experiment_info", {}).get("experiment_run_id", "") if isinstance(result, dict) else "",
-                    },
-                )
-        except Exception as exc:
-            logger.warning("Langfuse root span failed: %s", exc)
-            # Fall through to run without Langfuse
-            result = _execute_scan_steps(
-                scan_query=scan_query,
-                scan_id=scan_id,
-                scan_start=scan_start,
-                otl_tracer=otl_tracer,
-                langfuse_client=None,
-            )
-        finally:
-            try:
-                langfuse_client.flush()
-                logger.info("③ Langfuse traces flushed to cloud")
-            except Exception as exc:
-                logger.warning("Langfuse flush failed: %s", exc)
-    else:
-        result = _execute_scan_steps(
-            scan_query=scan_query,
-            scan_id=scan_id,
-            scan_start=scan_start,
-            otl_tracer=otl_tracer,
-            langfuse_client=None,
-        )
-
-    return result
 
 
 def _execute_scan_steps(
     scan_query: str,
     scan_id: str,
     scan_start: float,
-    otl_tracer: Optional[trace.Tracer],
-    langfuse_client: Optional["Langfuse"],
 ) -> Dict[str, Any]:
-    """Core scan steps – called within Langfuse root observation context."""
+    """
+    Core scan steps — orchestrates the full MCP + LLM cycle.
 
-    # ── Step 1: Agent → LLM Gateway → which tool?  (rule ②) ─────────────────
+    Steps:
+      1. Ask LLM which MCP tool to use (kubernetes or prometheus)
+      2. Call MCP server to fetch operational data
+      3. Send data to LLM for deep analysis
+      4. Inject experiment IDs from MCP Phase 3 into result
+    """
+
+    # ── Step 1: Agent → LLM Gateway → which tool? ───────────────────────────
     server_type = agent_request_tool_selection(
         user_query=scan_query,
-        otl_tracer=otl_tracer,
-        langfuse_client=langfuse_client,
         scan_id=scan_id,
     )
 
-    # ── Step 2: Agent → MCP Server → Tool Response  (rules ①a + ①b) ─────────
+    # ── Step 2: Agent → MCP Server → Tool Response ──────────────────────────
     mcp_data = agent_call_mcp_server(
         server_type=server_type,
         query=scan_query,
-        otl_tracer=otl_tracer,
-        langfuse_client=langfuse_client,
         scan_id=scan_id,
     )
 
     if mcp_data.get("error"):
         logger.warning("MCP returned an error – analysis will reflect degraded data")
 
-    # ── Step 3: Agent → LLM Gateway → analysis  (rule ②) ────────────────────
+    # ── Step 3: Agent → LLM Gateway → analysis ──────────────────────────────
     analysis = agent_request_llm_analysis(
         mcp_data=mcp_data,
         server_type=server_type,
-        otl_tracer=otl_tracer,
-        langfuse_client=langfuse_client,
         scan_id=scan_id,
     )
 
     if analysis is None:
         logger.error("LLM analysis failed – returning empty result")
-        # Still record workflow step spans (they use MCP data, not LLM output)
-        if langfuse_client:
-            try:
-                mcp_inner = mcp_data.get("data", {})
-                _record_workflow_step_spans(
-                    langfuse_client=langfuse_client,
-                    mcp_data=mcp_inner,
-                    llm_analysis=None,
-                    scan_id=scan_id,
-                )
-            except Exception as exc:
-                logger.warning("Failed to record workflow step spans: %s", exc)
         return {"health": {"overall_health_score": -1}, "issues": []}
 
-    # ── Inject experiment IDs from MCP Phase 3 into analysis result ───────────
+    # ── Inject experiment IDs from MCP Phase 3 into analysis result ──────────
     #    These come from Argo Workflow metadata.labels (resources_get),
     #    NOT from the LLM — so they are always accurate.
     mcp_inner_ids = mcp_data.get("data", {})
@@ -2529,33 +1786,9 @@ def _execute_scan_steps(
         analysis["experiment_info"] = {}
         logger.info("No workflow IDs available to inject (Phase 3 may have failed)")
 
-    # ── Step 3b: Record per-workflow-step Langfuse spans ─────────────────────
-    #    Uses chaos-exporter logs for REAL verdicts + LLM output for descriptions
-    if langfuse_client:
-        try:
-            mcp_inner = mcp_data.get("data", {})
-            _record_workflow_step_spans(
-                langfuse_client=langfuse_client,
-                mcp_data=mcp_inner,
-                llm_analysis=analysis,
-                scan_id=scan_id,
-            )
-        except Exception as exc:
-            logger.warning("Failed to record workflow step spans: %s", exc)
-
     duration = time.time() - scan_start
 
-    # ── Step 4: OTL Collector root span → Langfuse  (rule ③) ─────────────────
-    if otl_tracer:
-        otl_emit_root_scan_span(
-            tracer=otl_tracer,
-            analysis=analysis,
-            server_type=server_type,
-            duration_sec=duration,
-            scan_id=scan_id,
-        )
-
-    # ── Human-readable summary ────────────────────────────────────────────────
+    # ── Human-readable summary ───────────────────────────────────────────────
     health = analysis.get("health", {})
     issues = analysis.get("issues", [])
     logger.info(
@@ -2583,8 +1816,18 @@ def _execute_scan_steps(
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main() -> None:
+    """
+    Entry point for Flash Agent.
+
+    Runs in two modes:
+      - CronJob mode (SCAN_INTERVAL <= 0): single scan, then exit.
+      - Continuous mode (SCAN_INTERVAL > 0): scan every N seconds until shutdown.
+
+    All LLM calls go through LiteLLM proxy which handles Langfuse tracing
+    automatically.  No OTEL or Langfuse SDK initialization needed here.
+    """
     logger.info(
-        "Flash Agent v3.0.0 | agent=%s | namespace=%s | model=%s",
+        "Flash Agent v4.0.0 | agent=%s | namespace=%s | model=%s",
         AGENT_NAME, K8S_NAMESPACE, MODEL_ALIAS,
     )
     logger.info(
@@ -2592,12 +1835,9 @@ def main() -> None:
         K8S_NODE_IP, K8S_MCP_URL, PROM_MCP_URL,
     )
     logger.info(
-        "Storage rules: ① MCP→file(%s)+OTL  ② LLM→OTL  ③ OTL→Langfuse",
+        "Storage: ① MCP→file(%s)  ② LLM→LiteLLM→Langfuse",
         MCP_INTERACTIONS_FILE,
     )
-
-    otl_tracer      = init_otl_collector()
-    langfuse_client = _build_langfuse_client()
 
     scan_query = os.getenv(
         "SCAN_QUERY",
@@ -2608,31 +1848,18 @@ def main() -> None:
 
     if SCAN_INTERVAL <= 0:
         logger.info("CronJob mode – single scan")
-        agent_workflow(scan_query, otl_tracer, langfuse_client)
+        agent_workflow(scan_query)
     else:
         logger.info("Continuous mode – scan every %ds", SCAN_INTERVAL)
         while not _shutdown:
             try:
-                agent_workflow(scan_query, otl_tracer, langfuse_client)
+                agent_workflow(scan_query)
             except Exception as exc:
                 logger.exception("Scan cycle failed: %s", exc)
             for _ in range(SCAN_INTERVAL):
                 if _shutdown:
                     break
                 time.sleep(1)
-
-    # Flush OTL Collector → forwards to Langfuse (rule ③)
-    provider = trace.get_tracer_provider()
-    if hasattr(provider, "force_flush"):
-        provider.force_flush()
-        logger.info("③ OTL Collector flushed → Langfuse")
-
-    # Flush Langfuse direct client queue
-    if langfuse_client:
-        try:
-            langfuse_client.flush()
-        except Exception as exc:
-            logger.warning("Langfuse flush failed: %s", exc)
 
     logger.info("Flash Agent shut down cleanly")
 
