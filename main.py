@@ -29,6 +29,7 @@ import logging
 import os
 import signal
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -821,6 +822,12 @@ def agent_call_mcp_server(
 
     duration = time.time() - t0
 
+    # Attach internal timing/keys for agent context enrichment (not sent to LLM)
+    response_payload["_mcp_duration_sec"] = round(duration, 2)
+    response_payload["_mcp_data_keys"] = list(
+        response_payload.get("data", {}).keys()
+    )
+
     # Rule ①: save MCP interaction to SEPARATE FILE for audit/replay
     persist_mcp_interaction_to_file(
         server_type=server_type,
@@ -831,86 +838,6 @@ def agent_call_mcp_server(
     )
 
     return response_payload
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# WORKFLOW STEP PARSER — Extract per-step status from Argo Workflow CR
-# ══════════════════════════════════════════════════════════════════════════════
-
-# The expected sequential steps from the sock-shop chaos workflow
-EXPECTED_WORKFLOW_STEPS = [
-    "install-application",
-    "normalize-install-application-readiness",
-    "apply-workload-rbac",
-    "install-agent",
-    "install-chaos-faults",   # parallel with load-test
-    "load-test",              # parallel with install-chaos-faults
-    "pod-cpu-hog",
-    "pod-delete",
-    "pod-network-loss",
-    "pod-memory-hog",
-    "disk-fill",
-    "cleanup-chaos-resources",  # parallel with delete-loadtest
-    "delete-loadtest",          # parallel with cleanup-chaos-resources
-]
-
-# Map chaos step names to their target app and fault details (from the workflow YAML)
-CHAOS_STEP_METADATA: Dict[str, Dict[str, Any]] = {
-    "pod-cpu-hog": {
-        "fault_type": "pod-cpu-hog",
-        "target_app": "carts",
-        "target_ns": "sock-shop",
-        "target_kind": "deployment",
-        "duration": 30,
-        "probe": "check-frontend-access-url (HTTP GET front-end:80 == 200)",
-        "probe_mode": "Continuous",
-        "params": {"CPU_CORES": "1", "TOTAL_CHAOS_DURATION": "30",
-                   "CHAOS_KILL_COMMAND": "kill md5sum"},
-    },
-    "pod-delete": {
-        "fault_type": "pod-delete",
-        "target_app": "catalogue",
-        "target_ns": "sock-shop",
-        "target_kind": "deployment",
-        "duration": 30,
-        "probe": "check-catalogue-access-url (HTTP GET front-end:80/catalogue == 200)",
-        "probe_mode": "Edge",
-        "params": {"TOTAL_CHAOS_DURATION": "30", "CHAOS_INTERVAL": "10",
-                   "FORCE": "false"},
-    },
-    "pod-network-loss": {
-        "fault_type": "pod-network-loss",
-        "target_app": "user-db",
-        "target_ns": "sock-shop",
-        "target_kind": "statefulset",
-        "duration": 30,
-        "probe": "check-cards-access-url (HTTP GET front-end:80/cards == 200)",
-        "probe_mode": "Continuous",
-        "params": {"TOTAL_CHAOS_DURATION": "30",
-                   "NETWORK_PACKET_LOSS_PERCENTAGE": "100",
-                   "NETWORK_INTERFACE": "eth0"},
-    },
-    "pod-memory-hog": {
-        "fault_type": "pod-memory-hog",
-        "target_app": "orders",
-        "target_ns": "sock-shop",
-        "target_kind": "deployment",
-        "duration": 30,
-        "probe": "check-frontend-access-url (HTTP GET front-end:80 == 200)",
-        "probe_mode": "Continuous",
-        "params": {"TOTAL_CHAOS_DURATION": "30", "MEMORY_CONSUMPTION": "500"},
-    },
-    "disk-fill": {
-        "fault_type": "disk-fill",
-        "target_app": "catalogue-db",
-        "target_ns": "sock-shop",
-        "target_kind": "statefulset",
-        "duration": 30,
-        "probe": "check-catalogue-db-cr-status (k8sProbe: pod Running, label=name=catalogue-db)",
-        "probe_mode": "Continuous",
-        "params": {"TOTAL_CHAOS_DURATION": "30", "FILL_PERCENTAGE": "100"},
-    },
-}
 
 
 def _extract_mcp_text(mcp_result: Any) -> str:
@@ -1058,197 +985,6 @@ def _get_latest_workflow(wf_phases: Dict[str, str]) -> tuple:
 
     logger.info("Latest workflow: %s (phase=%s, epoch=%d)", best_name, best_phase, best_epoch)
     return (best_name, best_phase)
-
-
-def _parse_verdicts_from_exporter_logs(mcp_data: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
-    """
-    Parse REAL chaos verdicts from the chaos-exporter pod logs.
-    The exporter emits lines like:
-      FaultName=pod-network-loss ResultVerdict=Fail ProbeSuccessPercentage=0
-    Returns {fault_name: {verdict, probe_pct, is_final}}.
-    """
-    import re
-    verdicts: Dict[str, Dict[str, Any]] = {}
-
-    pods_log = mcp_data.get("pods_log", {})
-    exporter_text = ""
-    for pod_name, log_data in pods_log.items():
-        if "chaos-exporter" in pod_name:
-            exporter_text = _extract_mcp_text(log_data)
-            break
-
-    if not exporter_text:
-        logger.info("No chaos-exporter logs found in MCP data")
-        return verdicts
-
-    for line in exporter_text.split("\n"):
-        if "FaultName=" not in line:
-            continue
-        fault_m = re.search(r"FaultName=(\S+)", line)
-        verdict_m = re.search(r"ResultVerdict=(\S+)", line)
-        probe_m = re.search(r"ProbeSuccessPercentage=(\S+)", line)
-        end_m = re.search(r"EndTime=(\S+)", line)
-
-        if not fault_m:
-            continue
-
-        fault_name = fault_m.group(1)
-        verdict = verdict_m.group(1) if verdict_m else "Unknown"
-        probe_pct = probe_m.group(1) if probe_m else "0"
-        end_time = end_m.group(1) if end_m else "0"
-        is_final = end_time not in ("0", "0.0")
-
-        existing = verdicts.get(fault_name)
-        if existing is None or (is_final and not existing.get("is_final")):
-            verdicts[fault_name] = {
-                "verdict": verdict,
-                "probe_success_pct": probe_pct,
-                "is_final": is_final,
-            }
-
-    logger.info("Parsed exporter verdicts: %s",
-                {k: v["verdict"] for k, v in verdicts.items()})
-    return verdicts
-
-
-def _build_verdict_text_for_prompt(
-    verdicts: Dict[str, Dict[str, Any]],
-) -> str:
-    """
-    Build the pre-extracted verdicts text block to inject into the LLM prompt.
-    Includes ALL expected chaos faults — marks missing ones explicitly.
-    """
-    chaos_steps = [s for s in EXPECTED_WORKFLOW_STEPS if s in CHAOS_STEP_METADATA]
-
-    lines: List[str] = []
-    found = 0
-    missing = 0
-    for fault_name in chaos_steps:
-        idx = found + missing + 1
-        if fault_name in verdicts:
-            v = verdicts[fault_name]
-            lines.append(
-                f"  {idx}. {fault_name}: "
-                f"verdict={v['verdict']}, "
-                f"probe_success_pct={v['probe_success_pct']}, "
-                f"is_final={v['is_final']}"
-            )
-            found += 1
-        else:
-            lines.append(
-                f"  {idx}. {fault_name}: "
-                f"verdict=NO EXPORTER DATA (not found in chaos-exporter logs)"
-            )
-            missing += 1
-
-    real_passed = sum(1 for v in verdicts.values() if v["verdict"] == "Pass")
-    real_failed = sum(1 for v in verdicts.values() if v["verdict"] == "Fail")
-
-    header = (
-        f"Total expected chaos faults: {len(chaos_steps)}\n"
-        f"Faults with exporter verdicts: {found}\n"
-        f"Faults with no exporter data: {missing}\n"
-        f"Faults passed (verdict=Pass): {real_passed}\n"
-        f"Faults failed (verdict=Fail): {real_failed}\n\n"
-    )
-    return header + "\n".join(lines) if lines else "  (no chaos faults expected)"
-
-
-def _cross_validate_llm_with_verdicts(
-    result: Dict[str, Any],
-    verdicts: Dict[str, Dict[str, Any]],
-) -> None:
-    """
-    Cross-validate LLM analysis against real exporter verdicts.
-    Corrects experiment_summary counts and fills missing chaos_faults.
-    Mutates *result* in place.
-    """
-    if not result:
-        return
-
-    chaos_steps = [s for s in EXPECTED_WORKFLOW_STEPS if s in CHAOS_STEP_METADATA]
-    real_passed = sum(1 for v in verdicts.values() if v["verdict"] == "Pass")
-    real_failed = sum(1 for v in verdicts.values() if v["verdict"] == "Fail")
-    real_no_data = len(chaos_steps) - len(verdicts)
-
-    # ── Fix experiment_summary counts ──
-    exp = result.get("experiment_summary", {})
-    if exp:
-        old_passed = exp.get("faults_passed", "?")
-        old_failed = exp.get("faults_failed", "?")
-        if old_passed != real_passed or old_failed != real_failed:
-            logger.warning(
-                "Cross-validation: LLM fault counts mismatch — correcting: "
-                "LLM said passed=%s failed=%s, real is passed=%d failed=%d no_data=%d",
-                old_passed, old_failed, real_passed, real_failed, real_no_data,
-            )
-        exp["total_faults_executed"] = len(chaos_steps)
-        exp["faults_passed"] = real_passed
-        exp["faults_failed"] = real_failed
-        exp.setdefault("faults_no_data", real_no_data)
-
-        # Recalculate resilience
-        if real_failed == 0 and real_no_data == 0:
-            exp["overall_resilience"] = "resilient"
-        elif real_failed == 0:
-            exp["overall_resilience"] = "partially-resilient"
-        elif real_failed <= real_passed:
-            exp["overall_resilience"] = "partially-resilient"
-        else:
-            exp["overall_resilience"] = "fragile"
-
-    # ── Ensure ALL expected faults appear in chaos_faults ──
-    llm_faults = result.get("chaos_faults", [])
-    llm_fault_names = {f.get("fault_name", "") for f in llm_faults}
-
-    for fault_name in chaos_steps:
-        if fault_name in llm_fault_names:
-            # Override verdict with real data if available
-            for f in llm_faults:
-                if f.get("fault_name") == fault_name and fault_name in verdicts:
-                    real = verdicts[fault_name]
-                    if f.get("verdict") != real["verdict"]:
-                        logger.warning(
-                            "Cross-validation: verdict mismatch for %s: LLM=%s real=%s — correcting",
-                            fault_name, f.get("verdict"), real["verdict"],
-                        )
-                    f["verdict"] = real["verdict"]
-                    f["probe_success_percentage"] = real["probe_success_pct"]
-        else:
-            # Fault missing from LLM output — add it
-            meta = CHAOS_STEP_METADATA.get(fault_name, {})
-            if fault_name in verdicts:
-                real = verdicts[fault_name]
-                llm_faults.append({
-                    "fault_name": fault_name,
-                    "verdict": real["verdict"],
-                    "probe_success_percentage": real["probe_success_pct"],
-                    "target_app": meta.get("target_app"),
-                    "target_kind": meta.get("target_kind"),
-                    "chaos_duration_sec": meta.get("duration"),
-                    "impact_observed": "LLM did not analyse this fault — added by cross-validation",
-                    "recovery_observed": "insufficient data to determine recovery from provided logs",
-                    "resilience_assessment": f"Verdict={real['verdict']} probe={real['probe_success_pct']}%",
-                })
-            else:
-                llm_faults.append({
-                    "fault_name": fault_name,
-                    "verdict": "No Exporter Data",
-                    "probe_success_percentage": None,
-                    "target_app": meta.get("target_app"),
-                    "target_kind": meta.get("target_kind"),
-                    "chaos_duration_sec": meta.get("duration"),
-                    "impact_observed": "chaos-exporter did not report this fault — logs may have rotated",
-                    "recovery_observed": "N/A",
-                    "resilience_assessment": "Cannot assess — no exporter data available",
-                })
-            logger.info("Cross-validation: added missing fault %s to LLM output", fault_name)
-
-    result["chaos_faults"] = llm_faults
-    logger.info(
-        "Cross-validation complete: %d faults total (passed=%d failed=%d no_data=%d)",
-        len(chaos_steps), real_passed, real_failed, real_no_data,
-    )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1555,21 +1291,63 @@ def _build_llm_data_payload(mcp_data: Dict[str, Any], server_type: str) -> str:
                 + "\n".join(wf_log_parts)
             )
 
-    # ── 9. Pre-extracted verdicts (from our own parser) ──────────────────────
-    verdicts = _parse_verdicts_from_exporter_logs(mcp_data)
-    if verdicts:
-        sections.append(
-            f"## PRE-EXTRACTED VERDICTS (from chaos-exporter regex parse)\n"
-            + json.dumps(verdicts, indent=2)
-        )
-
     return "\n\n".join(sections)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Langfuse post-call metadata update (lightweight, no SDK)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _update_langfuse_generation_metadata(
+    generation_id: str,
+    extra_metadata: Dict[str, Any],
+) -> None:
+    """
+    Fire-and-forget POST to Langfuse ingestion API to merge additional
+    metadata into an existing generation span.
+
+    Used for Tier-2 fields that are only available **after** the LLM call
+    completes (token usage, fault pass/fail counts).  Langfuse deep-merges
+    metadata on observation-update events, so existing pre-call metadata
+    set via extra_body is preserved.
+
+    Requires LANGFUSE_HOST, LANGFUSE_PUBLIC_KEY, LANGFUSE_SECRET_KEY env vars.
+    Silently skipped when any of these are missing (e.g. local dev without
+    Langfuse, or unit tests).
+    """
+    host = os.getenv("LANGFUSE_HOST", "")
+    pk = os.getenv("LANGFUSE_PUBLIC_KEY", "")
+    sk = os.getenv("LANGFUSE_SECRET_KEY", "")
+    if not all((host, pk, sk)):
+        return
+    try:
+        requests.post(
+            f"{host.rstrip('/')}/api/public/ingestion",
+            json={
+                "batch": [
+                    {
+                        "id": str(uuid.uuid4()),
+                        "type": "observation-update",
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "body": {
+                            "id": generation_id,
+                            "metadata": extra_metadata,
+                        },
+                    }
+                ]
+            },
+            auth=(pk, sk),
+            timeout=5,
+        )
+    except Exception:
+        logger.debug("Langfuse post-call metadata update skipped", exc_info=True)
 
 
 def agent_request_llm_analysis(
     mcp_data: Dict[str, Any],
     server_type: str,
     scan_id: str = "",
+    agent_context: Optional[Dict[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
     """
     Agent → LLM Gateway (via LiteLLM): send MCP data for deep analysis.
@@ -1581,9 +1359,6 @@ def agent_request_llm_analysis(
     Returns parsed analysis dict or None on failure.
     """
     payload_text = _build_llm_data_payload(mcp_data, server_type)
-
-    # Parse verdicts locally — used ONLY for post-LLM cross-validation, NOT sent to LLM
-    verdicts = _parse_verdicts_from_exporter_logs(mcp_data)
 
     # Merge system instructions into user message for broad model compatibility
     combined_prompt = (
@@ -1602,6 +1377,7 @@ def agent_request_llm_analysis(
     result:      Optional[Dict[str, Any]] = None
     output_text: str = ""
     t0 = time.time()
+    _gen_id = str(uuid.uuid4())  # pre-generate so we can update metadata post-call
 
     # Extract experiment IDs from MCP Phase 3 data (already fetched)
     _mcp_inner = mcp_data.get("data", mcp_data) if isinstance(mcp_data, dict) else {}
@@ -1616,6 +1392,7 @@ def agent_request_llm_analysis(
             extra_body={
                 "metadata": {
                     "generation_name": "llm_analysis",
+                    "generation_id": _gen_id,
                     "scan_id": scan_id,
                     "step": "llm-analysis",
                     "namespace": K8S_NAMESPACE,
@@ -1623,6 +1400,7 @@ def agent_request_llm_analysis(
                     "experiment_id": _wf_ids.get("workflow_id", ""),
                     "experiment_run_id": _wf_ids.get("workflow_run_id", ""),
                     "workflow_name": _wf_ids.get("workflow_name", ""),
+                    **(agent_context or {}),
                 }
             },
         )
@@ -1640,9 +1418,6 @@ def agent_request_llm_analysis(
         elif "```" in json_text:
             json_text = json_text.split("```", 1)[1].split("```", 1)[0]
         result = json.loads(json_text.strip())
-
-        # Cross-validate LLM output against real exporter verdicts
-        _cross_validate_llm_with_verdicts(result, verdicts)
 
         # Log experiment summary if present
         exp = result.get("experiment_summary", {})
@@ -1678,6 +1453,26 @@ def agent_request_llm_analysis(
 
     duration = time.time() - t0
     logger.info("LLM analysis completed in %.2fs", duration)
+
+    # ── Tier 2: post-call metadata enrichment ─────────────────────────────
+    _post_meta: Dict[str, Any] = {}
+    if usage:
+        _post_meta["prompt_tokens"] = usage.get("prompt_tokens", 0)
+        _post_meta["completion_tokens"] = usage.get("completion_tokens", 0)
+        # Azure OpenAI returns cached_tokens in prompt_tokens_details
+        try:
+            ptd = getattr(resp.usage, "prompt_tokens_details", None)
+            _post_meta["cached_tokens"] = (
+                getattr(ptd, "cached_tokens", 0) or 0
+            ) if ptd else 0
+        except Exception:
+            _post_meta["cached_tokens"] = 0
+    if result:
+        _exp = result.get("experiment_summary", {})
+        _post_meta["faults_passed"] = _exp.get("faults_passed", 0)
+        _post_meta["faults_failed"] = _exp.get("faults_failed", 0)
+    if _post_meta:
+        _update_langfuse_generation_metadata(_gen_id, _post_meta)
 
     return result
 
@@ -1747,11 +1542,44 @@ def _execute_scan_steps(
     if mcp_data.get("error"):
         logger.warning("MCP returned an error – analysis will reflect degraded data")
 
+    # ── Build agent context for Langfuse trace enrichment ────────────────────
+    _mcp_inner = mcp_data.get("data", {}) if isinstance(mcp_data, dict) else {}
+    _summary = _build_mcp_data_summary(mcp_data)
+    _pods_info = _summary.get("pods", {})
+    _events_info = _summary.get("events", {})
+    _wf_info = _summary.get("argo_workflows", {})
+    _chaos_info = _summary.get("chaosengines", {})
+
+    agent_context: Dict[str, Any] = {
+        # Scan-level context
+        "scan_number": _scan_counter,
+        "mcp_server_type": server_type,
+        "mcp_duration_sec": mcp_data.get("_mcp_duration_sec", 0),
+        "mcp_data_keys": mcp_data.get("_mcp_data_keys", []),
+        # Pod metrics from MCP Phase 1
+        "pods_total": _pods_info.get("total", 0),
+        "pods_by_status": _pods_info.get("by_status", {}),
+        "pods_total_restarts": _pods_info.get("total_restarts", 0),
+        "high_restart_pods": _pods_info.get("restarted_pods", []),
+        # MCP error (if any)
+        "mcp_errors": mcp_data.get("error", None),
+        # Events from MCP Phase 1
+        "events_normal": _events_info.get("normal", 0),
+        "events_warning": _events_info.get("warning", 0),
+        # Workflow info from MCP Phase 1
+        "workflows_total": _wf_info.get("count", 0),
+        "workflow_latest": _wf_info.get("latest", ""),
+        # Chaos faults from MCP Phase 1
+        "chaos_engines_total": _chaos_info.get("count", 0),
+        "chaos_engine_names": _chaos_info.get("engines", []),
+    }
+
     # ── Step 3: Agent → LLM Gateway → analysis ──────────────────────────────
     analysis = agent_request_llm_analysis(
         mcp_data=mcp_data,
         server_type=server_type,
         scan_id=scan_id,
+        agent_context=agent_context,
     )
 
     if analysis is None:
