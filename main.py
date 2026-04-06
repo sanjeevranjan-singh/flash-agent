@@ -219,6 +219,7 @@ def agent_request_tool_selection(
             max_tokens=50,
             extra_body={
                 "metadata": {
+                    "generation_name": "tool_selection",
                     "scan_id": scan_id,
                     "step": "tool-selection",
                     "namespace": K8S_NAMESPACE,
@@ -1614,6 +1615,7 @@ def agent_request_llm_analysis(
             temperature=0.1,
             extra_body={
                 "metadata": {
+                    "generation_name": "llm_analysis",
                     "scan_id": scan_id,
                     "step": "llm-analysis",
                     "namespace": K8S_NAMESPACE,
