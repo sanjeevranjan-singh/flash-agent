@@ -313,6 +313,9 @@ def request_llm_analysis(
         else {}
     )
 
+    usage: Optional[Dict[str, int]] = None
+    result: Optional[Dict[str, Any]] = None
+
     try:
         resp = create_openai_client(cfg).chat.completions.create(
             model=cfg.model_alias,
