@@ -100,9 +100,6 @@ def request_tool_selection(
                     "step": "tool-selection",
                     "namespace": cfg.k8s_namespace,
                     "agent": cfg.agent_name,
-                    "experiment_id": "",
-                    "experiment_run_id": "",
-                    "workflow_name": "",
                 }
             },
         )
@@ -303,16 +300,6 @@ def request_llm_analysis(
     t0 = time.time()
     _gen_id = str(uuid.uuid4())
 
-    # Extract experiment IDs from MCP Phase 3 data
-    _mcp_inner = (
-        mcp_data.get("data", mcp_data) if isinstance(mcp_data, dict) else {}
-    )
-    _wf_ids = (
-        _mcp_inner.get("workflow_ids", {})
-        if isinstance(_mcp_inner, dict)
-        else {}
-    )
-
     usage: Optional[Dict[str, int]] = None
     result: Optional[Dict[str, Any]] = None
 
@@ -329,9 +316,6 @@ def request_llm_analysis(
                     "step": "llm-analysis",
                     "namespace": cfg.k8s_namespace,
                     "agent": cfg.agent_name,
-                    "experiment_id": _wf_ids.get("workflow_id", ""),
-                    "experiment_run_id": _wf_ids.get("workflow_run_id", ""),
-                    "workflow_name": _wf_ids.get("workflow_name", ""),
                     **(agent_context or {}),
                 }
             },
