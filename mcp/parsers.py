@@ -8,6 +8,7 @@ structured data for agent processing and LLM prompt construction.
 
 from __future__ import annotations
 
+import os
 import re
 from typing import Any, Dict, List
 
@@ -36,6 +37,7 @@ def extract_active_pod_names(
     Running or Error pods belonging to chaos workflow runs.
     Used for Phase 2 targeted pod-log fetching.
     """
+    target_app_pattern = os.getenv("TARGET_APP_POD_PATTERN", "sock-shop")
     pod_names: List[str] = []
     try:
         content = pod_list_result.get("content", [])
@@ -52,7 +54,7 @@ def extract_active_pod_names(
             status = parts[5]  # STATUS column
             # Target running or error pods from chaos / Argo workflows
             if status in ("Running", "Error") and (
-                "sock-shop" in pod_name
+                target_app_pattern in pod_name
                 or "argowf-chaos" in pod_name
                 or "chaos" in pod_name.lower()
             ):

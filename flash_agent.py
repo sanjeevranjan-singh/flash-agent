@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List
@@ -298,7 +299,7 @@ class FlashAgent:
                     "pods_list_in_namespace", {}
                 )
                 active_pods = extract_active_pod_names(
-                    pod_list_data, self.cfg.k8s_namespace
+                    pod_list_data, self.cfg.k8s_namespace,
                 )
                 if active_pods:
                     logger.info(
@@ -313,8 +314,9 @@ class FlashAgent:
                                 "namespace": self.cfg.k8s_namespace,
                                 "name": pod_name,
                             }
+                            _app = os.getenv("TARGET_APP_POD_PATTERN", "sock-shop")
                             if (
-                                "sock-shop-trace" in pod_name
+                                f"{_app}-trace" in pod_name
                                 or "argowf-chaos" in pod_name
                             ):
                                 log_args["container"] = "main"
