@@ -143,7 +143,7 @@ def generate_fallback_data(
             "status": "fallback",
             "reason": "MCP pod cannot reach Kubernetes API (DNS connectivity issue)",
             "data": {
-                "cluster": "sock-shop",
+                "cluster": namespace,
                 "namespace": namespace,
                 "timestamp": timestamp,
                 "pods": [
@@ -173,7 +173,7 @@ def generate_fallback_data(
             "status": "fallback",
             "reason": "MCP pod cannot reach Kubernetes API (DNS connectivity issue)",
             "data": {
-                "cluster": "sock-shop",
+                "cluster": namespace,
                 "timestamp": timestamp,
                 "metrics": {
                     "up": 0,
