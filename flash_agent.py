@@ -34,7 +34,7 @@ from domain.litmus import (
 )
 from llm.gateway import request_llm_analysis, request_tool_selection
 from mcp.client import MCPClient, generate_fallback_data
-from mcp.parsers import build_mcp_data_summary, extract_active_pod_names
+from mcp.parsers import build_mcp_data_summary, extract_active_pod_names, extract_mcp_text
 from observability.mcp_logger import persist_mcp_interaction
 
 logger = logging.getLogger("flash-agent")
@@ -123,31 +123,37 @@ class FlashAgent:
                 "MCP returned an error \u2013 analysis will reflect degraded data"
             )
 
-        # ── Issue 1 Fix: Workflow timing gate ────────────────────────────────
-        # Do not run LLM analysis until the Argo Workflow has reached a
-        # terminal phase (Succeeded, Failed, Error).  Running/Pending means
-        # the experiment is still in flight — analysing partial data now
-        # would produce unreliable fault verdicts.
+        # ── Issue 1 Fix: Fault verdict gate ──────────────────────────────────
+        # Skip LLM analysis only when NO ChaosResult has a final verdict yet
+        # (i.e. the very first scans before any fault step has completed).
+        # Once at least one fault has Pass/Fail, analysis runs so the certifier
+        # gets per-fault TTD/TTR as each fault completes — not one bulk analysis
+        # at the very end of the whole workflow.
         if self.cfg.include_chaos_tools:
-            _argo_raw = mcp_data.get("data", {}).get("argo_workflows", {})
-            _wf_phases = parse_workflow_phase_from_text(_argo_raw)
-            _latest_wf_name, _latest_wf_phase = get_latest_workflow(_wf_phases)
-            _terminal_phases = {"Succeeded", "Failed", "Error"}
-            if _latest_wf_name and _latest_wf_phase not in _terminal_phases:
+            _cr_raw = mcp_data.get("data", {}).get("chaosresults", {})
+            _cr_text = extract_mcp_text(_cr_raw)
+            _has_verdict = bool(
+                _cr_text and (
+                    "Pass" in _cr_text or "Fail" in _cr_text
+                )
+            )
+            if not _has_verdict:
+                _argo_raw = mcp_data.get("data", {}).get("argo_workflows", {})
+                _wf_phases = parse_workflow_phase_from_text(_argo_raw)
+                _latest_wf_name, _latest_wf_phase = get_latest_workflow(_wf_phases)
                 logger.info(
-                    "Workflow '%s' is still in phase '%s' — skipping LLM analysis "
-                    "until workflow reaches a terminal state.",
-                    _latest_wf_name,
-                    _latest_wf_phase,
+                    "No ChaosResult verdicts yet (workflow phase: %s) — "
+                    "skipping LLM analysis until at least one fault completes.",
+                    _latest_wf_phase or "unknown",
                 )
                 return {
                     "health": {
                         "overall_health_score": -1,
-                        "workflow_phase": _latest_wf_phase,
+                        "workflow_phase": _latest_wf_phase or "unknown",
                     },
                     "issues": [],
                     "experiment_info": {},
-                    "_skipped_reason": f"workflow_not_terminal:{_latest_wf_phase}",
+                    "_skipped_reason": "no_verdicts_yet",
                 }
 
         # ── Build agent context for Langfuse trace enrichment ────────────────
