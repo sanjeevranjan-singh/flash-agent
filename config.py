@@ -58,6 +58,11 @@ class AgentConfig:
     scan_interval: int
     scan_query: str
 
+    # SLA thresholds (embedded in Langfuse trace metadata for certifier)
+    sla_detect_sec: int
+    sla_mitigate_sec: int
+    sla_max_tool_calls: int
+
     # Langfuse (optional – for Tier-2 metadata updates)
     langfuse_host: str
     langfuse_public_key: str
@@ -96,6 +101,9 @@ class AgentConfig:
                 f"namespace '{k8s_namespace}'. "
                 "Identify pod failures, restarts, resource pressure, and anomalies.",
             ),
+            sla_detect_sec=int(os.getenv("SLA_DETECT_SEC", "300")),
+            sla_mitigate_sec=int(os.getenv("SLA_MITIGATE_SEC", "600")),
+            sla_max_tool_calls=int(os.getenv("SLA_MAX_TOOL_CALLS", "20")),
             langfuse_host=os.getenv("LANGFUSE_HOST", ""),
             langfuse_public_key=os.getenv("LANGFUSE_PUBLIC_KEY", ""),
             langfuse_secret_key=os.getenv("LANGFUSE_SECRET_KEY", ""),

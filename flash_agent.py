@@ -123,6 +123,33 @@ class FlashAgent:
                 "MCP returned an error \u2013 analysis will reflect degraded data"
             )
 
+        # ── Issue 1 Fix: Workflow timing gate ────────────────────────────────
+        # Do not run LLM analysis until the Argo Workflow has reached a
+        # terminal phase (Succeeded, Failed, Error).  Running/Pending means
+        # the experiment is still in flight — analysing partial data now
+        # would produce unreliable fault verdicts.
+        if self.cfg.include_chaos_tools:
+            _argo_raw = mcp_data.get("data", {}).get("argo_workflows", {})
+            _wf_phases = parse_workflow_phase_from_text(_argo_raw)
+            _latest_wf_name, _latest_wf_phase = get_latest_workflow(_wf_phases)
+            _terminal_phases = {"Succeeded", "Failed", "Error"}
+            if _latest_wf_name and _latest_wf_phase not in _terminal_phases:
+                logger.info(
+                    "Workflow '%s' is still in phase '%s' — skipping LLM analysis "
+                    "until workflow reaches a terminal state.",
+                    _latest_wf_name,
+                    _latest_wf_phase,
+                )
+                return {
+                    "health": {
+                        "overall_health_score": -1,
+                        "workflow_phase": _latest_wf_phase,
+                    },
+                    "issues": [],
+                    "experiment_info": {},
+                    "_skipped_reason": f"workflow_not_terminal:{_latest_wf_phase}",
+                }
+
         # ── Build agent context for Langfuse trace enrichment ────────────────
         _summary = build_mcp_data_summary(mcp_data)
         _pods_info = _summary.get("pods", {})
@@ -150,6 +177,13 @@ class FlashAgent:
             agent_context["workflow_latest"] = _wf_info.get("latest", "")
             agent_context["chaos_engines_total"] = _chaos_info.get("count", 0)
             agent_context["chaos_engine_names"] = _chaos_info.get("engines", [])
+
+        # Issue 5 Fix: embed SLA thresholds in agent_context so they are
+        # included in every Langfuse generation metadata payload via
+        # extra_body.metadata in gateway.py → visible to certifier.
+        agent_context["sla_detect_sec"] = self.cfg.sla_detect_sec
+        agent_context["sla_mitigate_sec"] = self.cfg.sla_mitigate_sec
+        agent_context["sla_max_tool_calls"] = self.cfg.sla_max_tool_calls
 
         # ── Step 3: LLM Analysis ────────────────────────────────────────────
         analysis = request_llm_analysis(
