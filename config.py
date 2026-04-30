@@ -58,6 +58,9 @@ class AgentConfig:
     scan_interval: int
     scan_query: str
 
+    # Experiment identity – injected by sidecar at runtime
+    notify_id: str          # = experiment_run_id / Langfuse trace_id
+
     # Langfuse (optional – for Tier-2 metadata updates)
     langfuse_host: str
     langfuse_public_key: str
@@ -96,6 +99,7 @@ class AgentConfig:
                 f"namespace '{k8s_namespace}'. "
                 "Identify pod failures, restarts, resource pressure, and anomalies.",
             ),
+            notify_id=os.getenv("NOTIFY_ID", ""),
             langfuse_host=os.getenv("LANGFUSE_HOST", ""),
             langfuse_public_key=os.getenv("LANGFUSE_PUBLIC_KEY", ""),
             langfuse_secret_key=os.getenv("LANGFUSE_SECRET_KEY", ""),

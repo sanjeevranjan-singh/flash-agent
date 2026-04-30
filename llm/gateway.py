@@ -127,8 +127,8 @@ def request_tool_selection(
             temperature=0,
             extra_body={
                 "metadata": {
-                    "trace_name": scan_id,
-                    "trace_id": scan_id,
+                    "trace_id": cfg.notify_id or scan_id,
+                    "session_id": scan_id,
                     "generation_name": "tool_selection",
                     "scan_id": scan_id,
                     "step": "tool-selection",
@@ -200,8 +200,8 @@ def request_hindsight_check(
             temperature=0,
             extra_body={
                 "metadata": {
-                    "trace_name": scan_id,
-                    "trace_id": scan_id,
+                    "trace_id": cfg.notify_id or scan_id,
+                    "session_id": scan_id,
                     "generation_name": "hindsight_check",
                     "scan_id": scan_id,
                     "step": "hindsight",
@@ -440,8 +440,8 @@ def request_llm_analysis(
             temperature=0.1,
             extra_body={
                 "metadata": {
-                    "trace_name": scan_id,
-                    "trace_id": scan_id,
+                    "trace_id": cfg.notify_id or scan_id,
+                    "session_id": scan_id,
                     "generation_name": "llm_analysis",
                     "generation_id": _gen_id,
                     "scan_id": scan_id,
