@@ -128,6 +128,7 @@ def request_tool_selection(
             extra_body={
                 "metadata": {
                     "trace_id": cfg.notify_id or scan_id,
+                    "trace_name": "experiment-run",
                     "session_id": scan_id,
                     "generation_name": "tool_selection",
                     "scan_id": scan_id,
@@ -201,6 +202,7 @@ def request_hindsight_check(
             extra_body={
                 "metadata": {
                     "trace_id": cfg.notify_id or scan_id,
+                    "trace_name": "experiment-run",
                     "session_id": scan_id,
                     "generation_name": "hindsight_check",
                     "scan_id": scan_id,
@@ -478,6 +480,7 @@ def request_llm_analysis(
             extra_body={
                 "metadata": {
                     "trace_id": cfg.notify_id or scan_id,
+                    "trace_name": "experiment-run",
                     "session_id": scan_id,
                     "generation_name": "llm_analysis",
                     "generation_id": _gen_id,
