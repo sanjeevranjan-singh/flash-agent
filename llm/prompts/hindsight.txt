@@ -8,10 +8,10 @@ Review the data summary below and answer TWO questions:
 
 1. SUFFICIENT: Is there enough data to perform a meaningful analysis?
    - YES if ANY of the following are present:
-       * Pod status counts (even all Running is useful — confirms healthy state)
+       * Pod status counts (even all Running is useful - confirms healthy state)
        * Per-pod restart counts > 0 with pod names
        * Any Kubernetes warning events (even 1 line is actionable)
-       * Any pod log lines (diagnostic or tail — even partial logs are enough)
+       * Any pod log lines (diagnostic or tail - even partial logs are enough)
        * Resource metrics (CPU or memory percentages)
    - NO only if ALL of the following are true:
        * Pod data is completely absent or every section returned an error
