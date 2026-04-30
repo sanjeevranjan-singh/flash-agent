@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 import time
 import uuid
 from datetime import datetime, timezone
@@ -24,34 +23,6 @@ from mcp.parsers import build_mcp_data_summary, extract_mcp_text
 from observability.langfuse import update_generation_metadata
 
 logger = logging.getLogger("flash-agent")
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Issue 2 Fix: Fault name anonymisation
-# ──────────────────────────────────────────────────────────────────────────────
-
-def _anonymize_chaos_names(names: List[str]) -> Dict[str, str]:
-    """
-    Return a mapping of raw K8s chaos object name → anonymised label.
-
-    ChaosResult / ChaosEngine names encode the fault type in their name
-    (e.g. ``pod-deletelfq6l-pod-delete``).  Passing these raw names to the
-    LLM leaks the ground-truth fault identity before the model has had a
-    chance to reason independently.  Replace each unique name with a
-    stable, zero-information label (``fault-001``, ``fault-002``, …).
-    """
-    mapping: Dict[str, str] = {}
-    counter = 1
-    for name in names:
-        if name not in mapping:
-            mapping[name] = f"fault-{counter:03d}"
-            counter += 1
-    return mapping
-
-
-def _apply_name_mapping(names: List[str], mapping: Dict[str, str]) -> List[str]:
-    """Replace each name using the provided mapping (pass-through if missing)."""
-    return [mapping.get(n, n) for n in names]
 
 
 # Per-process cache: model_alias → "max_tokens" | "max_completion_tokens".
@@ -236,22 +207,16 @@ def build_llm_data_payload(
         argo = summary.get("argo_workflows", {})
         if argo.get("count", 0) > 0:
             latest_name = argo.get("latest", "")
-            # Issue 2 Fix: anonymise workflow names so the epoch-suffix encoded
-            # fault identity is not exposed to the LLM.
-            all_wf_names = [w["name"] for w in argo.get("workflows", [])]
-            wf_name_map = _anonymize_chaos_names(all_wf_names)
-            anon_latest = wf_name_map.get(latest_name, latest_name)
             wf_lines = []
             for w in argo.get("workflows", []):
-                anon_name = wf_name_map.get(w["name"], w["name"])
                 marker = " \u2190 LATEST" if w["name"] == latest_name else ""
                 wf_lines.append(
-                    f"  - {anon_name}  phase={w.get('phase', '?')}  "
+                    f"  - {w['name']}  phase={w.get('phase', '?')}  "
                     f"age={w.get('age', '?')}{marker}"
                 )
             sections.append(
                 f"## ARGO WORKFLOWS ({argo['count']} total)\n"
-                f"Latest experiment workflow: {anon_latest}\n"
+                f"Latest experiment workflow: {latest_name}\n"
                 + "\n".join(wf_lines)
             )
 
@@ -259,37 +224,26 @@ def build_llm_data_payload(
     if include_chaos:
         cr = summary.get("chaosresults", {})
         if cr.get("count", 0) > 0:
-            # Issue 2 Fix: anonymise ChaosResult names before passing to LLM
-            anon_cr_names = _apply_name_mapping(
-                cr.get("results", []),
-                _anonymize_chaos_names(cr.get("results", [])),
-            )
             sections.append(
                 f"## CHAOSRESULTS ({cr['count']} total)\n"
-                f"  Names: {json.dumps(anon_cr_names)}"
+                f"  Names: {json.dumps(cr.get('results', []))}"
             )
 
     # ── 5. ChaosEngines ──────────────────────────────────────────────────────
     if include_chaos:
         ce = summary.get("chaosengines", {})
         if ce.get("count", 0) > 0:
-            # Issue 2 Fix: anonymise ChaosEngine names before passing to LLM
-            anon_ce_names = _apply_name_mapping(
-                ce.get("engines", []),
-                _anonymize_chaos_names(ce.get("engines", [])),
-            )
             sections.append(
                 f"## CHAOSENGINES ({ce['count']} total)\n"
-                f"  Names: {json.dumps(anon_ce_names)}"
+                f"  Names: {json.dumps(ce.get('engines', []))}"
             )
 
     # ── 6. chaos-exporter logs (CRITICAL — contains fault verdicts) ──────────
     if include_chaos:
         pods_log = mcp_data.get("data", mcp_data).get("pods_log", {})
         if isinstance(pods_log, dict):
-            for pod_name in pods_log:
+            for pod_name, log_data in pods_log.items():
                 if "chaos-exporter" in pod_name:
-                    log_data = pods_log[pod_name]
                     log_text = extract_mcp_text(log_data)
                     if log_text:
                         verdict_lines = [
@@ -299,27 +253,13 @@ def build_llm_data_payload(
                             or "ResultVerdict=" in l
                             or "ProbeSuccessPercentage=" in l
                         ]
-                        # Issue 2 Fix: replace raw FaultName values with
-                        # anonymised labels so the LLM cannot read the fault
-                        # identity directly from exporter metric names.
-                        raw_fault_names = re.findall(
-                            r"FaultName=(\S+)", log_text
-                        )
-                        _fault_map = _anonymize_chaos_names(
-                            list(dict.fromkeys(raw_fault_names))
-                        )
-                        def _sub_fault(text: str) -> str:
-                            for raw, anon in _fault_map.items():
-                                text = text.replace(raw, anon)
-                            return text
-                        verdict_lines = [_sub_fault(l) for l in verdict_lines]
                         sections.append(
                             f"## CHAOS-EXPORTER LOGS ({pod_name})\n"
                             f"### Verdict lines (extracted):\n"
                             + "\n".join(verdict_lines[-30:])
                             + "\n\n"
                             f"### Full log (truncated to 6000 chars):\n"
-                            + _sub_fault(log_text[-6000:])
+                            + log_text[-6000:]
                         )
 
     # ── 7. chaos-operator logs (compact) ─────────────────────────────────────
@@ -339,16 +279,6 @@ def build_llm_data_payload(
     pods_log = mcp_data.get("data", mcp_data).get("pods_log", {})
     if isinstance(pods_log, dict):
         wf_log_parts: List[str] = []
-        # Issue 2 Fix: build anonymisation map for chaos runner pod names
-        # (argowf-chaos-<fault-type>-<suffix>) before the loop so each pod
-        # gets a stable label across all sections.
-        chaos_runner_pods = [
-            p for p in pods_log
-            if p not in ("chaos-exporter", "chaos-operator")
-            and ("argowf-chaos" in p or re.search(r"argowf-.*-\w{4,}", p))
-        ]
-        pod_name_map = _anonymize_chaos_names(chaos_runner_pods)
-
         for pod_name, log_data in pods_log.items():
             if "chaos-exporter" in pod_name or "chaos-operator" in pod_name:
                 continue
@@ -360,9 +290,8 @@ def build_llm_data_payload(
                     if "error" in l.lower() or "failed" in l.lower()
                 ]
                 if error_lines:
-                    display_name = pod_name_map.get(pod_name, pod_name)
                     wf_log_parts.append(
-                        f"  [{display_name}] ({len(error_lines)} error lines):\n"
+                        f"  [{pod_name}] ({len(error_lines)} error lines):\n"
                         + "\n".join(
                             f"    {l[:200]}" for l in error_lines[-5:]
                         )
@@ -399,19 +328,23 @@ def request_llm_analysis(
         include_chaos=cfg.include_chaos_tools,
     )
 
-    # Issue 3 Fix: split into system (instructions) + user (data) messages
-    # instead of a single concatenated user message.  This gives the model
-    # a clearer separation between the schema it must follow and the
-    # evidence it must reason over, improving JSON adherence.
+    combined_prompt = (
+        f"INSTRUCTIONS:\n{analysis_prompt}\n\n"
+        f"DATA TO ANALYSE:\n{payload_text}"
+    )
+
+    combined_prompt = (
+        f"INSTRUCTIONS:\n{analysis_prompt}\n\n"
+        f"DATA TO ANALYSE:\n{payload_text}"
+    )
     messages: List[Dict[str, str]] = [
-        {"role": "system", "content": analysis_prompt},
-        {"role": "user", "content": f"DATA TO ANALYSE:\n{payload_text}"},
+        {"role": "user", "content": combined_prompt},
     ]
 
     logger.info(
         "Agent \u2192 LLM Gateway: requesting analysis of %s MCP data (%d chars) \u2026",
         server_type,
-        len(payload_text),
+        len(combined_prompt),
     )
 
     result: Optional[Dict[str, Any]] = None

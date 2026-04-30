@@ -34,7 +34,7 @@ from domain.litmus import (
 )
 from llm.gateway import request_llm_analysis, request_tool_selection
 from mcp.client import MCPClient, generate_fallback_data
-from mcp.parsers import build_mcp_data_summary, extract_active_pod_names, extract_mcp_text
+from mcp.parsers import build_mcp_data_summary, extract_active_pod_names
 from observability.mcp_logger import persist_mcp_interaction
 
 logger = logging.getLogger("flash-agent")
@@ -123,54 +123,6 @@ class FlashAgent:
                 "MCP returned an error \u2013 analysis will reflect degraded data"
             )
 
-        # ── Issue 1 Fix: Chaos-active gate ───────────────────────────────────
-        # A blind ITOps agent has no knowledge of what faults are injected.
-        # It should start analysing as soon as chaos infrastructure is present
-        # in the namespace (ChaosEngines or ChaosResults appearing = chaos is
-        # active), not after a step "Succeeds".
-        #
-        # During the install phase (steps 1-2), there are no ChaosEngine or
-        # ChaosResult objects yet — the MCP list returns only the column header
-        # (~43 chars). Once chaos injection begins, objects are created and the
-        # text grows well beyond that.  We use 100 chars as the threshold.
-        #
-        # This preserves TTD accuracy: the certifier measures time from fault
-        # injection (ChaosEngine creation) to first agent detection, so the
-        # agent must start analysing as soon as it sees chaos infrastructure.
-        if self.cfg.include_chaos_tools:
-            _cr_text = extract_mcp_text(
-                mcp_data.get("data", {}).get("chaosresults", {})
-            )
-            _ce_text = extract_mcp_text(
-                mcp_data.get("data", {}).get("chaosengines", {})
-            )
-            _CHAOS_ACTIVE_THRESHOLD = 100  # chars — above header-only output
-            _chaos_active = (
-                len(_cr_text.strip()) > _CHAOS_ACTIVE_THRESHOLD
-                or len(_ce_text.strip()) > _CHAOS_ACTIVE_THRESHOLD
-            )
-            if not _chaos_active:
-                _argo_raw = mcp_data.get("data", {}).get("argo_workflows", {})
-                _wf_phases = parse_workflow_phase_from_text(_argo_raw)
-                _latest_wf_name, _latest_wf_phase = get_latest_workflow(_wf_phases)
-                logger.info(
-                    "Install phase — no chaos infrastructure yet "
-                    "(chaosengines: %d chars, chaosresults: %d chars, "
-                    "workflow: %s) — skipping LLM analysis.",
-                    len(_ce_text.strip()),
-                    len(_cr_text.strip()),
-                    _latest_wf_phase or "unknown",
-                )
-                return {
-                    "health": {
-                        "overall_health_score": -1,
-                        "workflow_phase": _latest_wf_phase or "unknown",
-                    },
-                    "issues": [],
-                    "experiment_info": {},
-                    "_skipped_reason": "install_phase_no_chaos_infra",
-                }
-
         # ── Build agent context for Langfuse trace enrichment ────────────────
         _summary = build_mcp_data_summary(mcp_data)
         _pods_info = _summary.get("pods", {})
@@ -198,13 +150,6 @@ class FlashAgent:
             agent_context["workflow_latest"] = _wf_info.get("latest", "")
             agent_context["chaos_engines_total"] = _chaos_info.get("count", 0)
             agent_context["chaos_engine_names"] = _chaos_info.get("engines", [])
-
-        # Issue 5 Fix: embed SLA thresholds in agent_context so they are
-        # included in every Langfuse generation metadata payload via
-        # extra_body.metadata in gateway.py → visible to certifier.
-        agent_context["sla_detect_sec"] = self.cfg.sla_detect_sec
-        agent_context["sla_mitigate_sec"] = self.cfg.sla_mitigate_sec
-        agent_context["sla_max_tool_calls"] = self.cfg.sla_max_tool_calls
 
         # ── Step 3: LLM Analysis ────────────────────────────────────────────
         analysis = request_llm_analysis(
