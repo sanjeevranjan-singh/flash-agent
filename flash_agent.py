@@ -151,59 +151,28 @@ class FlashAgent:
             agent_context["chaos_engines_total"] = _chaos_info.get("count", 0)
             agent_context["chaos_engine_names"] = _chaos_info.get("engines", [])
 
-        # ── Workflow phase gate ──────────────────────────────────────────────
-        # Chaos-exporter fault verdicts are only written once the Argo workflow
-        # reaches a terminal phase (Succeeded / Failed / Error).  Running the
-        # LLM analysis while the workflow is still in Running state produces an
-        # incomplete result with no verdicts — which would cause the certifier
-        # to score the agent on a scan that had no useful signal.
-        # Gate only applies when chaos tools are enabled; without them we have
-        # no argo_workflows data to check.
-        if self.cfg.include_chaos_tools:
-            _wf_phases = parse_workflow_phase_from_text(
-                mcp_data.get("data", {}).get("argo_workflows", {})
-            )
-            _latest_name, _latest_phase = get_latest_workflow(_wf_phases)
-            if _latest_phase == "Running":
-                logger.warning(
-                    "Workflow '%s' is still Running — chaos verdicts not yet "
-                    "available. Skipping LLM analysis this cycle.",
-                    _latest_name,
-                )
-                return {
-                    "health": {"overall_health_score": -1},
-                    "issues": [],
-                    "experiment_info": {},
-                    "_skipped_reason": (
-                        f"workflow '{_latest_name}' phase=Running; "
-                        "verdicts unavailable"
-                    ),
-                }
-
-        # ── Hindsight / data-quality self-assessment (Flash pattern) ────────
-        # Mirrors AIOpsLab Flash's HindsightBuilder: before firing the full
-        # analysis LLM call, do a fast check that the collected data has enough
-        # signal. If not, skip analysis and report the gap so the next scan
-        # cycle can collect more targeted data.
+        # ── Hindsight / data-quality annotation (Flash pattern) ────────────
+        # Mirrors AIOpsLab Flash's HindsightBuilder: assess data quality before
+        # the analysis call and annotate agent_context with the result.
+        # Unlike a skip gate, this NEVER blocks the analysis — the agent must
+        # always produce an observation so the certifier has a trace to score.
+        # If data is thin the LLM will correctly report "no issues detected" or
+        # "insufficient telemetry", which is itself a valid observation.
         hindsight = request_hindsight_check(
             cfg=self.cfg,
             mcp_data=mcp_data,
             server_type=server_type,
             scan_id=scan_id,
         )
+        agent_context["data_sufficient"] = hindsight.get("sufficient", True)
         if not hindsight.get("sufficient", True):
-            next_focus = hindsight.get("next_focus", "insufficient data")
-            logger.warning(
-                "Hindsight check: data insufficient for analysis — %s. "
-                "Skipping LLM analysis this cycle.",
-                next_focus,
+            agent_context["data_quality_note"] = hindsight.get(
+                "next_focus", "insufficient data"
             )
-            return {
-                "health": {"overall_health_score": -1},
-                "issues": [],
-                "experiment_info": {},
-                "_skipped_reason": f"hindsight: {next_focus}",
-            }
+            logger.info(
+                "Hindsight: data quality low (%s) — proceeding with analysis anyway",
+                agent_context["data_quality_note"],
+            )
 
         # ── Step 3: LLM Analysis ────────────────────────────────────────────
         analysis = request_llm_analysis(
