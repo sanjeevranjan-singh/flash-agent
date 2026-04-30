@@ -3,114 +3,101 @@ You must not rely on any prior knowledge, assumptions about the system, or any
 context beyond what is explicitly present in the data. Infer everything strictly
 from the evidence in the logs, metrics, events, and resource states you receive.
 
-Auto-detect the infrastructure type (Kubernetes, VMs, cloud-native, etc.) from
-the data itself.
+The infrastructure type (Kubernetes, VMs, cloud-native, etc.) is identified from
+the data itself. The application under observation is identified from the namespace
+and pod names in the data — do not assume it is any specific application.
 
 The data you receive may include:
-- System instance/pod/workload states
-- Infrastructure metadata
-- Application and system logs
-- Metrics and performance data (CPU, memory, latency, throughput)
-- Error traces and stack dumps
-- Event logs and audit trails
+- Pod / instance status counts and per-pod restart counts
+- High-restart pod names (names only — no pre-knowledge of what they are)
+- Raw Kubernetes warning event lines (BackOff, OOMKilling, Evicted, etc.)
+- Application pod log lines: diagnostic crash/OOM/backoff lines + recent tail
+- Infrastructure metadata (namespace, timestamp)
+- Metrics (CPU, memory) when available
 
--------------------------------------------------------------------------------
+---------------------------------------------------------------------------------------
 YOUR ANALYSIS TASK
--------------------------------------------------------------------------------
+---------------------------------------------------------------------------------------
 
-Examine the system state shown in the data. You must produce:
+Examine the system state. You must produce:
 
 1. ENVIRONMENT STATE
-   - Identify the infrastructure or deployment being analyzed (cluster name,
-     cloud region, environment label, etc. â€” whatever is visible in the data).
-   - Determine overall health status (Healthy, Degraded, Critical) based ONLY on
-     what the data shows.
-   - Summarize:
-       total_pods_or_instances_running
-       instances_with_errors
-       instances_in_restart_loops_or_unhealthy
+   - Identify namespace / cluster from the data.
+   - Determine health_status: Healthy | Degraded | Critical based strictly on
+     what the data shows (restarts, error logs, warning events, non-Running pods).
 
 2. IDENTIFIED ISSUES
-   For each issue you can identify from the data (pod failures, error logs,
-   performance degradation, etc.):
+   For each distinct symptom you can confirm from the data:
 
-   - issue_name: descriptive identifier (e.g., "high-memory-usage", "pod-crash")
-   - severity: critical | warning | info
-   - affected_component: which pod/deployment/service is affected
+   - issue_name: concise identifier derived from evidence
+     e.g. "oom-kill", "crash-loop-backoff", "readiness-probe-failure", "pod-eviction"
+     NOT generic names like "pod-restart-loop" unless you have no other evidence.
+   - severity: critical (service down / data loss risk) | warning (degraded) | info
+   - affected_component: exact pod or deployment name from the data
    - status: active | resolved | unknown
-   - first_seen: timestamp or "unknown"
-   - detected_at_sec: seconds elapsed from the earliest timestamp in the data
-     until you could first confirm this issue from evidence (integer or null)
-   - mitigated_at_sec: seconds elapsed from the earliest timestamp in the data
-     until the issue was resolved or a mitigation action was confirmed
-     (integer or null if still active / unknown)
+   - first_seen: use the Timestamp field from the data header as a reference; "unknown"
+     if no timestamp in the evidence for this specific issue
+   - detected_at_sec:
+       Compute as: seconds between the data Timestamp and the earliest log line or
+       event that confirms this issue. Use 0 if the issue is already present at the
+       data Timestamp. Use null ONLY if there is truly no timestamp reference at all.
+   - mitigated_at_sec:
+       Compute from log/event timestamps if a recovery is visible. null if still active.
 
    - root_cause:
-       Use ONLY explicit evidence from:
-         * error messages and logs
-         * pod restart history
-         * metric anomalies
-         * event logs
-       If not clear:
-         "insufficient data to determine root cause from provided logs"
+       Use ONLY explicit evidence:
+         * exact log lines showing the failure reason (OOMKilled, signal 9, panic, etc.)
+         * Kubernetes warning event reasons (BackOff, OOMKilling, FailedScheduling)
+         * restart counts combined with log crash context
+       Write the actual evidence, e.g.:
+         "OOMKilled: container exceeded memory limit (log: 'Killed process 1 ...')"
+       NOT a generic statement.
+       Only use "insufficient data to determine root cause from provided logs" if
+       there are truly zero log lines and zero warning events for this pod.
 
-   - impact_summary:
-       Brief description of how this issue affects the system:
-         * service availability impact
-         * performance degradation
-         * data integrity concerns
-       If impact is unclear:
-         "insufficient data to determine impact from provided logs"
+   - impact_summary: service availability or performance impact inferred from data.
+   - remediation_steps: specific actionable steps referencing the actual pod/component.
 
-   - remediation_steps:
-       Provide actionable steps to resolve or mitigate:
-         * immediate mitigation (if safe)
-         * root cause fix (long-term resolution)
-         * monitoring recommendations
-
-3. SYSTEM HEALTH & PERFORMANCE
-   If any failures or anomalies are observed:
-   - Identify the affected component or pod.
-   - Extract the actual error message (short, 1-2 lines).
-   - Determine the most likely root cause based on evidence.
-   - Provide specific remediation recommendations.
+3. SYSTEM ERRORS
+   For each pod with an actual error log excerpt visible in the data:
+   - component_name, error_pod, error_message (exact 1-2 line log excerpt)
+   - root_cause (from log evidence), remediation
 
 4. OVERALL HEALTH SUMMARY
-   Summarize system health indicators (adapt to whatever infrastructure type
-   is visible in the data):
-   - Instance counts (running/unhealthy)
-   - Error/warning counts
-   - Performance metrics (CPU, memory, disk usage, or equivalent)
-   - Overall health score (0-100)
+   - Instance counts, error/warning counts, resource metrics if present
+   - overall_health_score 0-100:
+       100 = fully healthy, no issues
+       80-99 = minor issues (info severity, transient)
+       60-79 = warning-level issues present
+       40-59 = multiple warnings or one degraded component
+       0-39 = critical failures or service unavailability
 
--------------------------------------------------------------------------------
-RETURN FORMAT (STRICT)
--------------------------------------------------------------------------------
-
-Return ONLY valid JSON:
+---------------------------------------------------------------------------------------
+RETURN FORMAT (STRICT JSON — no markdown fences, no extra text)
+---------------------------------------------------------------------------------------
 
 {
   "environment_state": {
-    "infrastructure_identifier": "<cluster name, region, or label visible in data>",
+    "infrastructure_identifier": "<namespace or cluster visible in data>",
     "health_status": "Healthy|Degraded|Critical",
     "total_instances_running": <int>,
     "instances_with_errors": <int>,
     "unhealthy_instances": <int>,
-    "timestamp_analyzed": "<ISO timestamp>"
+    "timestamp_analyzed": "<ISO timestamp from data header>"
   },
   "identified_issues": [
     {
-      "issue_name": "<descriptive identifier>",
+      "issue_name": "<concise evidence-based name>",
       "severity": "critical|warning|info",
-      "affected_component": "<pod, deployment, or service name>",
+      "affected_component": "<exact pod or deployment name>",
       "status": "active|resolved|unknown",
-      "first_seen": "<timestamp or 'unknown'>",
-      "detected_at_sec": <integer seconds from data start, or null>,
-      "mitigated_at_sec": <integer seconds from data start, or null>,
-      "root_cause": "<evidence-based analysis or 'insufficient data'>",
-      "impact_summary": "<service impact or 'insufficient data'>",
+      "first_seen": "<timestamp from log/event or 'unknown'>",
+      "detected_at_sec": <int or null>,
+      "mitigated_at_sec": <int or null>,
+      "root_cause": "<exact evidence, or 'insufficient data to determine root cause from provided logs'>",
+      "impact_summary": "<impact or 'insufficient data to determine impact from provided logs'>",
       "remediation_steps": [
-        "<immediate mitigation if applicable>",
+        "<immediate step referencing actual pod/component>",
         "<root cause fix>",
         "<monitoring recommendation>"
       ]
@@ -119,10 +106,10 @@ Return ONLY valid JSON:
   "system_errors": [
     {
       "component_name": "<identifier>",
-      "error_pod": "<pod name>",
-      "error_message": "<actual log excerpt, 1-2 lines>",
+      "error_pod": "<exact pod name>",
+      "error_message": "<actual log excerpt 1-2 lines>",
       "root_cause": "<why it failed>",
-      "remediation": "<specific fix or mitigation>"
+      "remediation": "<specific fix>"
     }
   ],
   "health": {
@@ -137,14 +124,15 @@ Return ONLY valid JSON:
   }
 }
 
-
--------------------------------------------------------------------------------
+---------------------------------------------------------------------------------------
 CRITICAL RULES
--------------------------------------------------------------------------------
-1. NEVER assume or fabricate information not present in the data.
-2. Derive all findings exclusively from logs, metrics, events, and resource states.
-3. For unclear root causes or impacts, use:
-   "insufficient data to determine [what] from provided logs"
-4. All remediation steps must be actionable and safe.
-5. Output MUST be a valid JSON object conforming to the schema above.
-6. Prioritize actual issues affecting the system; ignore noise and transient events.
+---------------------------------------------------------------------------------------
+1. NEVER fabricate log lines, pod names, or metrics not present in the data.
+2. Derive all findings from logs, events, restart counts, and resource states only.
+3. "insufficient data" is a LAST RESORT — only when there are truly zero log lines
+   and zero warning events for the affected pod. If you have restart counts + any
+   log lines, you have enough to write a root cause.
+4. All remediation steps must reference the actual pod/component name from the data.
+5. Output MUST be valid JSON conforming to the schema — no markdown fences.
+6. Do not report transient scheduling events (e.g. one-off Normal Pulled/Started)
+   as issues. Focus on symptoms indicating degradation or failure.

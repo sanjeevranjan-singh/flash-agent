@@ -7,14 +7,27 @@ analysis, or whether the agent should collect more targeted data first.
 Review the data summary below and answer TWO questions:
 
 1. SUFFICIENT: Is there enough data to perform a meaningful analysis?
-   - YES: the data contains pod states, events, logs, or metrics with concrete
-     evidence (errors, restarts, resource spikes, or confirmed healthy state)
-   - NO: the data is empty, all sections errored, or contains only headers
-     with no rows
+   - YES if ANY of the following are present:
+       * Pod status counts (even all Running is useful — confirms healthy state)
+       * Per-pod restart counts > 0 with pod names
+       * Any Kubernetes warning events (even 1 line is actionable)
+       * Any pod log lines (diagnostic or tail — even partial logs are enough)
+       * Resource metrics (CPU or memory percentages)
+   - NO only if ALL of the following are true:
+       * Pod data is completely absent or every section returned an error
+       * Log sections are empty (no lines at all, not just no errors)
+       * No events data at all
 
 2. NEXT_FOCUS (only if SUFFICIENT=NO): What specific additional data would
    most improve the analysis? One short sentence, e.g.:
    "Fetch logs from restarting pods" or "Query Prometheus for error rate"
+
+Important:
+- If you can see pod names + restart counts, that is sufficient.
+- If you can see warning event lines, that is sufficient.
+- If you can see log tail lines (even routine logs), that is sufficient.
+- Do NOT return sufficient=false just because there are no errors in the logs.
+  Absence of errors is itself a valid signal (system is healthy).
 
 Reply with EXACTLY this JSON format (no other text):
 {"sufficient": true}

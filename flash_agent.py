@@ -328,6 +328,7 @@ class FlashAgent:
                 )
                 active_pods = extract_active_pod_names(
                     pod_list_data, self.cfg.k8s_namespace,
+                    target_app_name=self.cfg.target_app_name,
                 )
                 if active_pods:
                     logger.info(
@@ -342,9 +343,8 @@ class FlashAgent:
                                 "namespace": self.cfg.k8s_namespace,
                                 "name": pod_name,
                             }
-                            _app = os.getenv("TARGET_APP_NAME", "sock-shop")
                             if (
-                                f"{_app}-trace" in pod_name
+                                f"{self.cfg.target_app_name}-trace" in pod_name
                                 or "argowf-chaos" in pod_name
                             ):
                                 log_args["container"] = "main"

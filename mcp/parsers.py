@@ -8,7 +8,6 @@ structured data for agent processing and LLM prompt construction.
 
 from __future__ import annotations
 
-import os
 import re
 from typing import Any, Dict, List
 
@@ -31,37 +30,76 @@ def extract_mcp_text(mcp_result: Any) -> str:
 def extract_active_pod_names(
     pod_list_result: Dict[str, Any],
     namespace: str,
+    target_app_name: str = "",
 ) -> List[str]:
     """
-    Parse the pods_list_in_namespace MCP result and return names of
-    Running or Error pods belonging to chaos workflow runs.
-    Used for Phase 2 targeted pod-log fetching.
+    Parse the pods_list_in_namespace MCP result and return names of pods
+    to fetch logs for in Phase 2.
+
+    Priority 1 (always): any pod in a non-Running/non-Completed state
+    (Error, CrashLoopBackOff, OOMKilled, Terminating, Pending, etc.)
+    Priority 2 (always): any Running pod with restarts > 0
+    Priority 3: chaos/argo workflow pods + pods matching target_app_name
+
+    target_app_name is passed from cfg.target_app_name (set via TARGET_APP_NAME
+    env var, defaults to the watched namespace). This ensures the function works
+    for any application under test, not just sock-shop.
     """
-    target_app_name = os.getenv("TARGET_APP_NAME", "sock-shop")
-    pod_names: List[str] = []
+    # Fall back to namespace as identifier when no explicit app name given
+    if not target_app_name:
+        target_app_name = namespace
+    unhealthy: List[str] = []
+    restarted: List[str] = []
+    workflow: List[str] = []
+
+    HEALTHY_STATES = {"Running", "Completed", "Succeeded"}
+
     try:
         content = pod_list_result.get("content", [])
         if not content:
-            return pod_names
+            return []
         text = content[0].get("text", "")
         for line in text.strip().split("\n"):
             if line.startswith("NAMESPACE") or not line.strip():
-                continue  # skip header
+                continue
             parts = line.split()
             if len(parts) < 6:
                 continue
-            pod_name = parts[3]  # NAME column
-            status = parts[5]  # STATUS column
-            # Target running or error pods from chaos / Argo workflows
-            if status in ("Running", "Error") and (
-                target_app_name in pod_name
-                or "argowf-chaos" in pod_name
+            pod_name = parts[3]   # NAME column
+            status   = parts[5]   # STATUS column
+            restarts_raw = parts[6] if len(parts) > 6 else "0"
+            try:
+                restarts = int(restarts_raw.split("/")[0])
+            except (ValueError, IndexError):
+                restarts = 0
+
+            is_chaos = (
+                "argowf-chaos" in pod_name
                 or "chaos" in pod_name.lower()
-            ):
-                pod_names.append(pod_name)
+                or target_app_name in pod_name
+            )
+
+            if status not in HEALTHY_STATES:
+                unhealthy.append(pod_name)
+            elif restarts > 0:
+                restarted.append(pod_name)
+            elif is_chaos:
+                workflow.append(pod_name)
+
     except Exception as exc:
         logger.warning("Failed to extract pod names for log fetching: %s", exc)
-    return pod_names
+        return []
+
+    # Combine with priority order, deduplicate, limit to 8 total
+    seen: set = set()
+    result: List[str] = []
+    for pod in unhealthy + restarted + workflow:
+        if pod not in seen:
+            seen.add(pod)
+            result.append(pod)
+        if len(result) >= 8:
+            break
+    return result
 
 
 def build_mcp_data_summary(response_payload: Dict[str, Any], include_chaos: bool = True) -> Dict[str, Any]:

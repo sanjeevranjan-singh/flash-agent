@@ -268,10 +268,31 @@ def build_llm_data_payload(
             f"High-restart pods: {json.dumps(pods.get('restarted_pods', []))}"
         )
 
-    # ── 2. Events summary ────────────────────────────────────────────────────
+    # ── 2. Events summary (with warning details if available) ─────────────────
     events = summary.get("events", {})
     if events:
-        sections.append(f"## EVENTS\n{json.dumps(events)}")
+        events_line = (
+            f"normal={events.get('normal', 0)}  "
+            f"warning={events.get('warning', 0)}"
+        )
+        reasons = events.get("warning_reasons", [])
+        if reasons:
+            events_line += f"  reasons={json.dumps(reasons)}"
+        sections.append(f"## EVENTS\n{events_line}")
+
+        # Append raw warning event lines (up to 10) for LLM context
+        events_text = extract_mcp_text(mcp_data.get("data", mcp_data).get("events_list", {}))
+        if events_text:
+            warning_lines = [
+                l.strip()
+                for l in events_text.strip().split("\n")
+                if "Warning" in l and l.strip() and not l.startswith("NAMESPACE")
+            ]
+            if warning_lines:
+                sections.append(
+                    f"## WARNING EVENTS (latest {min(len(warning_lines),10)})\n"
+                    + "\n".join(warning_lines[-10:])
+                )
 
     # ── 3. Argo Workflows (sorted newest-first, latest marked) ───────────────
     if include_chaos:
@@ -346,31 +367,47 @@ def build_llm_data_payload(
                             + log_text[-2000:]
                         )
 
-    # ── 8. Workflow pod logs (error lines only) ──────────────────────────────
+    # ── 8. App pod logs (symptom pods: restarts, errors, crashes) ─────────────
+    # Includes ALL non-chaos pods that have logs — last 30 lines plus any
+    # error/crash/oom/killed/failed lines — so the LLM can determine root cause.
     pods_log = mcp_data.get("data", mcp_data).get("pods_log", {})
     if isinstance(pods_log, dict):
-        wf_log_parts: List[str] = []
+        app_log_parts: List[str] = []
         for pod_name, log_data in pods_log.items():
             if "chaos-exporter" in pod_name or "chaos-operator" in pod_name:
                 continue
             log_text = extract_mcp_text(log_data)
-            if log_text:
-                error_lines = [
-                    l.strip()
-                    for l in log_text.split("\n")
-                    if "error" in l.lower() or "failed" in l.lower()
-                ]
-                if error_lines:
-                    wf_log_parts.append(
-                        f"  [{pod_name}] ({len(error_lines)} error lines):\n"
-                        + "\n".join(
-                            f"    {l[:200]}" for l in error_lines[-5:]
-                        )
-                    )
-        if wf_log_parts:
+            if not log_text or not log_text.strip():
+                continue
+            lines = [l.strip() for l in log_text.strip().split("\n") if l.strip()]
+            # Prioritise diagnostic lines (errors, kills, OOM, restarts)
+            diag_keywords = (
+                "error", "failed", "fatal", "panic", "oomkilled",
+                "killed", "crash", "exception", "timeout", "refused",
+                "backoff", "readiness", "liveness",
+            )
+            diag_lines = [
+                l for l in lines
+                if any(kw in l.lower() for kw in diag_keywords)
+            ]
+            # Use last 30 lines as context; if diagnostic lines exist, include them first
+            tail_lines = lines[-30:]
+            combined = diag_lines[-10:] + ["----- recent log tail -----"] + tail_lines
+            # Deduplicate while preserving order
+            seen_log: set = set()
+            deduped = []
+            for ln in combined:
+                if ln not in seen_log:
+                    seen_log.add(ln)
+                    deduped.append(ln)
+            app_log_parts.append(
+                f"  [{pod_name}]\n"
+                + "\n".join(f"    {l[:220]}" for l in deduped)
+            )
+        if app_log_parts:
             sections.append(
-                f"## WORKFLOW POD LOGS (error lines only)\n"
-                + "\n".join(wf_log_parts)
+                f"## APP POD LOGS (diagnostic lines + last 30 lines per pod)\n"
+                + "\n\n".join(app_log_parts)
             )
 
     return "\n\n".join(sections)
