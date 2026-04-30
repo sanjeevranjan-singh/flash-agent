@@ -32,7 +32,7 @@ from domain.litmus import (
     get_prometheus_tool_calls,
     parse_workflow_phase_from_text,
 )
-from llm.gateway import request_llm_analysis, request_tool_selection
+from llm.gateway import request_llm_analysis, request_tool_selection, request_hindsight_check
 from mcp.client import MCPClient, generate_fallback_data
 from mcp.parsers import build_mcp_data_summary, extract_active_pod_names
 from observability.mcp_logger import persist_mcp_interaction
@@ -150,6 +150,60 @@ class FlashAgent:
             agent_context["workflow_latest"] = _wf_info.get("latest", "")
             agent_context["chaos_engines_total"] = _chaos_info.get("count", 0)
             agent_context["chaos_engine_names"] = _chaos_info.get("engines", [])
+
+        # ── Workflow phase gate ──────────────────────────────────────────────
+        # Chaos-exporter fault verdicts are only written once the Argo workflow
+        # reaches a terminal phase (Succeeded / Failed / Error).  Running the
+        # LLM analysis while the workflow is still in Running state produces an
+        # incomplete result with no verdicts — which would cause the certifier
+        # to score the agent on a scan that had no useful signal.
+        # Gate only applies when chaos tools are enabled; without them we have
+        # no argo_workflows data to check.
+        if self.cfg.include_chaos_tools:
+            _wf_phases = parse_workflow_phase_from_text(
+                mcp_data.get("data", {}).get("argo_workflows", {})
+            )
+            _latest_name, _latest_phase = get_latest_workflow(_wf_phases)
+            if _latest_phase == "Running":
+                logger.warning(
+                    "Workflow '%s' is still Running — chaos verdicts not yet "
+                    "available. Skipping LLM analysis this cycle.",
+                    _latest_name,
+                )
+                return {
+                    "health": {"overall_health_score": -1},
+                    "issues": [],
+                    "experiment_info": {},
+                    "_skipped_reason": (
+                        f"workflow '{_latest_name}' phase=Running; "
+                        "verdicts unavailable"
+                    ),
+                }
+
+        # ── Hindsight / data-quality self-assessment (Flash pattern) ────────
+        # Mirrors AIOpsLab Flash's HindsightBuilder: before firing the full
+        # analysis LLM call, do a fast check that the collected data has enough
+        # signal. If not, skip analysis and report the gap so the next scan
+        # cycle can collect more targeted data.
+        hindsight = request_hindsight_check(
+            cfg=self.cfg,
+            mcp_data=mcp_data,
+            server_type=server_type,
+            scan_id=scan_id,
+        )
+        if not hindsight.get("sufficient", True):
+            next_focus = hindsight.get("next_focus", "insufficient data")
+            logger.warning(
+                "Hindsight check: data insufficient for analysis — %s. "
+                "Skipping LLM analysis this cycle.",
+                next_focus,
+            )
+            return {
+                "health": {"overall_health_score": -1},
+                "issues": [],
+                "experiment_info": {},
+                "_skipped_reason": f"hindsight: {next_focus}",
+            }
 
         # ── Step 3: LLM Analysis ────────────────────────────────────────────
         analysis = request_llm_analysis(

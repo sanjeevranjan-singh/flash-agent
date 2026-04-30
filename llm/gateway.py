@@ -108,7 +108,8 @@ def request_tool_selection(
     """
     tool_selection_prompt = _load_prompt("tool_selection")
     messages: List[Dict[str, str]] = [
-        {"role": "user", "content": f"{tool_selection_prompt}\n\nQuery: {user_query}"},
+        {"role": "system", "content": tool_selection_prompt},
+        {"role": "user", "content": f"Query: {user_query}"},
     ]
     logger.info("Agent \u2192 LLM Gateway: requesting tool selection \u2026")
 
@@ -154,6 +155,72 @@ def request_tool_selection(
     logger.info("Tool selection completed in %.2fs \u2192 %s", duration, decision)
 
     return decision
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 2.5 – Hindsight / Data-Quality Check  (mirrors AIOpsLab Flash pattern)
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+def request_hindsight_check(
+    cfg: AgentConfig,
+    mcp_data: Dict[str, Any],
+    server_type: str,
+    scan_id: str = "",
+) -> Dict[str, Any]:
+    """
+    Lightweight self-assessment after MCP collection and before LLM analysis.
+
+    Mirrors the AIOpsLab Flash HindsightBuilder pattern: before committing to a
+    full analysis LLM call, ask a fast model whether the collected data has
+    enough signal.  Returns {"sufficient": True} or
+    {"sufficient": False, "next_focus": "<guidance>"}.
+
+    If the LLM call fails or returns unparseable output, defaults to
+    {"sufficient": True} so the main analysis still runs.
+    """
+    hindsight_prompt = _load_prompt("hindsight")
+    summary = build_mcp_data_summary(mcp_data)
+    summary_text = json.dumps(summary, indent=2)
+
+    messages: List[Dict[str, str]] = [
+        {"role": "system", "content": hindsight_prompt},
+        {"role": "user", "content": f"DATA SUMMARY:\n{summary_text}"},
+    ]
+
+    try:
+        resp = _chat_create(
+            create_openai_client(cfg),
+            cfg.model_alias,
+            100,
+            model=cfg.model_alias,
+            messages=messages,
+            temperature=0,
+            extra_body={
+                "metadata": {
+                    "generation_name": "hindsight_check",
+                    "scan_id": scan_id,
+                    "step": "hindsight",
+                    "namespace": cfg.k8s_namespace,
+                    "agent": cfg.agent_name,
+                }
+            },
+        )
+        raw = (resp.choices[0].message.content or "").strip()
+        if "```json" in raw:
+            raw = raw.split("```json", 1)[1].split("```", 1)[0]
+        elif "```" in raw:
+            raw = raw.split("```", 1)[1].split("```", 1)[0]
+        result = json.loads(raw.strip())
+        logger.info(
+            "Hindsight check: sufficient=%s%s",
+            result.get("sufficient"),
+            f" | next_focus={result['next_focus']!r}" if not result.get("sufficient") else "",
+        )
+        return result
+    except Exception as exc:
+        logger.warning("Hindsight check failed (%s) – defaulting to sufficient=True", exc)
+        return {"sufficient": True}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -328,23 +395,15 @@ def request_llm_analysis(
         include_chaos=cfg.include_chaos_tools,
     )
 
-    combined_prompt = (
-        f"INSTRUCTIONS:\n{analysis_prompt}\n\n"
-        f"DATA TO ANALYSE:\n{payload_text}"
-    )
-
-    combined_prompt = (
-        f"INSTRUCTIONS:\n{analysis_prompt}\n\n"
-        f"DATA TO ANALYSE:\n{payload_text}"
-    )
     messages: List[Dict[str, str]] = [
-        {"role": "user", "content": combined_prompt},
+        {"role": "system", "content": analysis_prompt},
+        {"role": "user", "content": f"DATA TO ANALYSE:\n{payload_text}"},
     ]
 
     logger.info(
         "Agent \u2192 LLM Gateway: requesting analysis of %s MCP data (%d chars) \u2026",
         server_type,
-        len(combined_prompt),
+        sum(len(m["content"]) for m in messages),
     )
 
     result: Optional[Dict[str, Any]] = None
