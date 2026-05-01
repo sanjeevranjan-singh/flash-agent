@@ -184,6 +184,12 @@ Treat the glyph as evidence the same way you treat a Kubernetes warning event:
       analysis - do not flag them based on raw values alone. Use restart count,
       logs, and warning events to judge those pods.
 
+      EXCEPTION: when a "(no declared limit)" row also carries a ⚠️ glyph
+      labelled "elevated absolute load" or "critical absolute load", treat the
+      glyph the same as a saturation glyph for rules P1, P2, P4. The threshold
+      was applied by the data pipeline (PROM_CPU_ABS_WARN_CORES /
+      PROM_MEM_ABS_WARN_MB) so the agent does not need to invent one.
+
   P6. The Prometheus rubric is independent of Kubernetes events and logs. A
       scan with NO warning events but WITH a ⚠️ glyph is still Degraded. A scan
       with warning events but NO glyph is judged on the events alone.

@@ -41,6 +41,12 @@ def extract_active_pod_names(
     (Error, CrashLoopBackOff, OOMKilled, Terminating, Pending, etc.)
     Priority 2 (always): any Running pod with restarts > 0
     Priority 3: chaos/argo workflow pods + pods matching target_app_name
+    Priority 4 (topology): any remaining pods in the watched namespace, in the
+    order they appear in the pod list, so the agent always has SOME log evidence
+    to reason from even when no pod is visibly degraded.  Industry SREs sample
+    logs from every workload during incident triage; flash-agent must too,
+    otherwise external faults (cpu-hog, network-loss) that do not restart the
+    pod produce zero log signal and the LLM cannot detect them.
 
     target_app_name is passed from cfg.target_app_name (set via TARGET_APP_NAME
     env var, defaults to the watched namespace). This ensures the function works
@@ -52,6 +58,7 @@ def extract_active_pod_names(
     unhealthy: List[str] = []
     restarted: List[str] = []
     workflow: List[str] = []
+    topology: List[str] = []
 
     HEALTHY_STATES = {"Running", "Completed", "Succeeded"}
 
@@ -86,6 +93,11 @@ def extract_active_pod_names(
                 restarted.append(pod_name)
             elif is_chaos:
                 workflow.append(pod_name)
+            else:
+                # Healthy app pod – still sample its logs so the agent
+                # has visibility into the workload during chaos that
+                # never crashes the pod (cpu-hog, network-loss, …).
+                topology.append(pod_name)
 
     except Exception as exc:
         logger.warning("Failed to extract pod names for log fetching: %s", exc)
@@ -94,7 +106,7 @@ def extract_active_pod_names(
     # Combine with priority order, deduplicate, limit to 8 total
     seen: set = set()
     result: List[str] = []
-    for pod in unhealthy + restarted + workflow:
+    for pod in unhealthy + restarted + workflow + topology:
         if pod not in seen:
             seen.add(pod)
             result.append(pod)
@@ -155,40 +167,82 @@ def build_mcp_data_summary(response_payload: Dict[str, Any], include_chaos: bool
             summary["pods"]["restarted_pods"] = high_restart_pods[:5]
 
     # ── events_list → event type breakdown ───────────────────────────────────
+    # The MCP server can return events in two shapes:
+    #   (A) kubectl-style table: one line per event with TYPE/REASON/OBJECT/MSG
+    #   (B) YAML-ish blocks: multi-line records separated by a blank line, each
+    #       line in the form "Field: value" (Type, Reason, Object, Message…).
+    # The previous version only handled (A) – it filtered single lines that
+    # contained "Warning" and matched a hardcoded keyword allow-list.  Under
+    # shape (B) every real reason (Unhealthy, BackOff, FailedScheduling, …) is
+    # on a SEPARATE line from "Type: Warning", so the filter discarded all body
+    # information and the LLM saw only "Type: Warning" repeated.  This block
+    # parser handles both shapes by walking event records.
     events_text = extract_mcp_text(mcp_data.get("events_list", {}))
     if events_text:
         if "No events found" in events_text or not events_text.strip():
             summary["events"] = {"total": 0, "note": "No events found"}
         else:
-            warning_reasons: List[str] = []
             normal_count = 0
             warning_count = 0
-            for line in events_text.strip().split("\n"):
-                if line.startswith("NAMESPACE") or not line.strip():
-                    continue
-                if "Warning" in line:
+            warning_reasons: List[str] = []
+
+            # Split into blocks: blank-line separator first, otherwise treat
+            # each non-header line as its own one-line block (table shape).
+            raw = events_text.strip()
+            blocks: List[List[str]] = []
+            if "\n\n" in raw:
+                for chunk in raw.split("\n\n"):
+                    lines = [l for l in chunk.splitlines() if l.strip()]
+                    if lines:
+                        blocks.append(lines)
+            else:
+                for line in raw.splitlines():
+                    if line.startswith("NAMESPACE") or not line.strip():
+                        continue
+                    blocks.append([line])
+
+            for block in blocks:
+                joined = "\n".join(block)
+                # Classify Warning vs Normal at block scope (handles both shapes)
+                is_warning = bool(re.search(r"\bType\s*:\s*Warning\b", joined)) \
+                             or "Warning" in block[0]
+                is_normal  = bool(re.search(r"\bType\s*:\s*Normal\b", joined)) \
+                             or "Normal" in block[0]
+
+                if is_warning:
                     warning_count += 1
-                    for keyword in (
-                        "BackOff",
-                        "Failed",
-                        "FailedScheduling",
-                        "Unhealthy",
-                        "OOMKilling",
-                        "Evicted",
-                        "FailedMount",
-                        "FailedCreate",
-                    ):
-                        if keyword in line:
-                            warning_reasons.append(keyword)
-                            break
-                elif "Normal" in line:
+                    # Extract Reason (YAML-ish "Reason: X") OR pull a known
+                    # reason keyword from the table line.  We do NOT redact
+                    # the reason – it is operational signal, not fault identity.
+                    reason_match = re.search(r"\bReason\s*:\s*([A-Za-z0-9_-]+)", joined)
+                    if reason_match:
+                        warning_reasons.append(reason_match.group(1))
+                    else:
+                        for kw in (
+                            "BackOff", "Failed", "FailedScheduling",
+                            "Unhealthy", "OOMKilling", "Evicted",
+                            "FailedMount", "FailedCreate", "ProbeWarning",
+                            "ProbeFailed", "NodeNotReady", "Killing",
+                        ):
+                            if kw in joined:
+                                warning_reasons.append(kw)
+                                break
+                elif is_normal:
                     normal_count += 1
+
             summary["events"] = {
                 "normal": normal_count,
                 "warning": warning_count,
             }
             if warning_reasons:
-                summary["events"]["warning_reasons"] = warning_reasons[:5]
+                # Preserve order, dedup, cap at 10 distinct reasons
+                seen_r: set = set()
+                deduped = []
+                for r in warning_reasons:
+                    if r not in seen_r:
+                        seen_r.add(r)
+                        deduped.append(r)
+                summary["events"]["warning_reasons"] = deduped[:10]
 
     # ── pods_top → resource usage or error ───────────────────────────────────
     pods_top_data = mcp_data.get("pods_top", {})

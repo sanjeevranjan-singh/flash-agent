@@ -393,18 +393,40 @@ def build_llm_data_payload(
             events_line += f"  reasons={json.dumps(reasons)}"
         sections.append(f"## EVENTS\n{events_line}")
 
-        # Append raw warning event lines (up to 10) for LLM context
+        # Append raw warning event blocks (up to 10) for LLM context.
+        # K8s events are multi-line records (Type/Reason/Object/Message…) –
+        # if we filter on a single line containing "Warning" we lose the body.
+        # Walk blocks, keep blocks that mark Type: Warning, and emit the full
+        # block so Reason and Message reach the LLM.
         events_text = extract_mcp_text(mcp_data.get("data", mcp_data).get("events_list", {}))
         if events_text:
-            warning_lines = [
-                l.strip()
-                for l in events_text.strip().split("\n")
-                if "Warning" in l and l.strip() and not l.startswith("NAMESPACE")
-            ]
-            if warning_lines:
+            raw_evt = events_text.strip()
+            warning_blocks: List[str] = []
+
+            if "\n\n" in raw_evt:
+                # YAML-ish blocks separated by blank lines
+                for chunk in raw_evt.split("\n\n"):
+                    lines = [l for l in chunk.splitlines() if l.strip()]
+                    if not lines:
+                        continue
+                    block_text = "\n".join(lines)
+                    if re.search(r"\bType\s*:\s*Warning\b", block_text) \
+                       or (lines[0].strip().startswith("Type:") is False
+                           and "Warning" in lines[0]):
+                        warning_blocks.append(block_text)
+            else:
+                # kubectl-table shape – one line per event
+                for line in raw_evt.splitlines():
+                    if not line.strip() or line.startswith("NAMESPACE"):
+                        continue
+                    if "Warning" in line:
+                        warning_blocks.append(line.strip())
+
+            if warning_blocks:
+                kept = warning_blocks[-10:]
                 sections.append(
-                    f"## WARNING EVENTS (latest {min(len(warning_lines),10)})\n"
-                    + "\n".join(warning_lines[-10:])
+                    f"## WARNING EVENTS (latest {len(kept)})\n"
+                    + "\n---\n".join(kept)
                 )
 
     # ── 2b. Prometheus metrics snapshot ──────────────────────────────────────
@@ -420,23 +442,55 @@ def build_llm_data_payload(
                 f"pod_phase_counts={json.dumps(prom['pod_phase_counts'])}"
             )
 
-        # Saturation-warning threshold (usage / declared limit). Domain-agnostic:
-        # we judge each pod against the limit its operator already declared.
+        # Saturation thresholds – domain-agnostic, configurable.
+        # PROM_SATURATION_WARN: usage / declared limit (when limit exists)
+        # PROM_CPU_ABS_WARN_CORES + PROM_MEM_ABS_WARN_MB: absolute fallback for
+        # workloads that do not declare resource limits (e.g. sock-shop demo
+        # apps).  Without a fallback every chaos cpu-hog / memory-hog scan is
+        # silently skipped because every pod row is tagged "(no declared limit)".
         try:
             sat_warn = float(os.getenv("PROM_SATURATION_WARN", "0.8"))
         except ValueError:
             sat_warn = 0.8
+        try:
+            cpu_abs_warn  = float(os.getenv("PROM_CPU_ABS_WARN_CORES", "0.5"))
+            cpu_abs_crit  = float(os.getenv("PROM_CPU_ABS_CRIT_CORES", "1.5"))
+            mem_abs_warn  = float(os.getenv("PROM_MEM_ABS_WARN_MB",   "256"))
+            mem_abs_crit  = float(os.getenv("PROM_MEM_ABS_CRIT_MB",   "1024"))
+        except ValueError:
+            cpu_abs_warn, cpu_abs_crit = 0.5, 1.5
+            mem_abs_warn, mem_abs_crit = 256.0, 1024.0
 
         def _fmt_sat(p: Dict[str, Any], unit: str) -> str:
-            """Render one pod row with limit + saturation glyph if available."""
+            """Render one pod row with limit + saturation glyph if available.
+
+            When the workload declares a resource limit, use saturation
+            (usage / limit) and warn at PROM_SATURATION_WARN.  When no limit
+            is declared, fall back to absolute-value thresholds so cpu-hog /
+            memory-hog faults are still visible to the LLM.
+            """
             sat = p.get("saturation")
             limit = p.get("limit")
-            base = f"  - {p['pod']}: {p['value']:.3f}{unit}"
-            if sat is None or limit is None:
-                return base + " (no declared limit)"
-            line = f"{base} / limit {limit:.3f}{unit} = {sat*100:.0f}% saturation"
-            if sat > sat_warn:
-                line += f"  \u26a0\ufe0f >{int(sat_warn*100)}% saturation"
+            value = p["value"]
+            base = f"  - {p['pod']}: {value:.3f}{unit}"
+            if sat is not None and limit is not None:
+                line = f"{base} / limit {limit:.3f}{unit} = {sat*100:.0f}% saturation"
+                if sat > sat_warn:
+                    line += f"  \u26a0\ufe0f >{int(sat_warn*100)}% saturation"
+                return line
+
+            # No declared limit – use absolute thresholds. The thresholds are
+            # generic SRE rules of thumb (cpu > 0.5 cores or mem > 256 MB on a
+            # baseline microservice indicates pressure).
+            is_cpu = "core" in unit
+            warn_thr = cpu_abs_warn if is_cpu else mem_abs_warn
+            crit_thr = cpu_abs_crit if is_cpu else mem_abs_crit
+            metric_label = "CPU" if is_cpu else "memory"
+            line = f"{base} (no declared limit)"
+            if value >= crit_thr:
+                line += f"  \u26a0\ufe0f {metric_label} >= {crit_thr:g}{unit} (critical absolute load)"
+            elif value >= warn_thr:
+                line += f"  \u26a0\ufe0f {metric_label} >= {warn_thr:g}{unit} (elevated absolute load)"
             return line
 
         cpu_top = prom.get("cpu_per_pod_top", [])

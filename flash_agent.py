@@ -357,7 +357,7 @@ class FlashAgent:
                         active_pods,
                     )
                     pods_log_results: Dict[str, Any] = {}
-                    for pod_name in active_pods[:5]:
+                    for pod_name in active_pods[:8]:
                         try:
                             log_args: Dict[str, Any] = {
                                 "namespace": self.cfg.k8s_namespace,
