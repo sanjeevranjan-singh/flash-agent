@@ -407,7 +407,13 @@ def _top_pods(rows: List[Dict[str, Any]], limit: int = 10) -> List[Dict[str, Any
 
 
 def _summarize_prometheus(prom_data: Dict[str, Any]) -> Dict[str, Any]:
-    """Build a compact summary of Prometheus snapshot keyed by result_key."""
+    """Build a compact summary of Prometheus snapshot keyed by result_key.
+
+    Computes per-pod saturation = current_usage / declared_limit when limits
+    are defined on the workload. This makes anomaly detection domain-agnostic:
+    we don't need to know whether the workload is sock-shop, mongo, or kafka -
+    every pod is judged against its own declared resource envelope.
+    """
     summary: Dict[str, Any] = {}
 
     up_rows = _parse_prom_instant(prom_data.get("prometheus_up"))
@@ -418,24 +424,50 @@ def _summarize_prometheus(prom_data: Dict[str, Any]) -> Dict[str, Any]:
     if pod_count_rows:
         summary["pod_count"] = int(pod_count_rows[0]["value"])
 
+    # ── per-pod limits (used for saturation calc) ─────────────────────────
+    cpu_limits: Dict[str, float] = {}
+    for r in _parse_prom_instant(prom_data.get("cpu_limit_per_pod")):
+        pod = r["labels"].get("pod")
+        if pod and r["value"] > 0:
+            cpu_limits[pod] = r["value"]
+
+    mem_limits: Dict[str, float] = {}
+    for r in _parse_prom_instant(prom_data.get("memory_limit_per_pod")):
+        pod = r["labels"].get("pod")
+        if pod and r["value"] > 0:
+            mem_limits[pod] = r["value"]
+
+    # ── CPU usage + saturation ────────────────────────────────────────────
     cpu_rows = _parse_prom_instant(prom_data.get("cpu_per_pod"))
     if cpu_rows:
-        summary["cpu_per_pod_top"] = _top_pods(cpu_rows)
-        summary["cpu_high_pods"] = [
-            p for p in summary["cpu_per_pod_top"] if p["value"] > 0.5
-        ]
+        enriched = []
+        for r in cpu_rows:
+            pod = r["labels"].get("pod", "")
+            limit = cpu_limits.get(pod)
+            sat = (r["value"] / limit) if limit else None
+            enriched.append({
+                "labels": r["labels"],
+                "value": r["value"],
+                "limit": limit,
+                "saturation": sat,
+            })
+        summary["cpu_per_pod_top"] = _top_pods_with_sat(enriched)
 
+    # ── memory usage + saturation ─────────────────────────────────────────
     mem_rows = _parse_prom_instant(prom_data.get("memory_per_pod"))
     if mem_rows:
-        # Convert bytes → MB for readability
-        mem_mb = [
-            {"labels": r["labels"], "value": r["value"] / (1024 * 1024)}
-            for r in mem_rows
-        ]
-        summary["memory_per_pod_top_mb"] = _top_pods(mem_mb)
-        summary["memory_high_pods_mb"] = [
-            p for p in summary["memory_per_pod_top_mb"] if p["value"] > 500
-        ]
+        enriched = []
+        for r in mem_rows:
+            pod = r["labels"].get("pod", "")
+            limit = mem_limits.get(pod)
+            sat = (r["value"] / limit) if limit else None
+            enriched.append({
+                "labels": r["labels"],
+                "value": r["value"] / (1024 * 1024),  # MB
+                "limit": (limit / (1024 * 1024)) if limit else None,
+                "saturation": sat,
+            })
+        summary["memory_per_pod_top_mb"] = _top_pods_with_sat(enriched)
 
     restart_rows = _parse_prom_instant(prom_data.get("restarts_per_pod"))
     if restart_rows:
@@ -457,3 +489,19 @@ def _summarize_prometheus(prom_data: Dict[str, Any]) -> Dict[str, Any]:
         summary["network_rx_per_pod_top"] = _top_pods(net_rows)
 
     return summary
+
+
+def _top_pods_with_sat(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Like _top_pods but preserves limit/saturation fields."""
+    out: List[Dict[str, Any]] = []
+    for r in sorted(rows, key=lambda x: x["value"], reverse=True):
+        pod = r["labels"].get("pod")
+        if not pod:
+            continue
+        out.append({
+            "pod": pod,
+            "value": round(r["value"], 4),
+            "limit": round(r["limit"], 4) if r.get("limit") is not None else None,
+            "saturation": round(r["saturation"], 4) if r.get("saturation") is not None else None,
+        })
+    return out

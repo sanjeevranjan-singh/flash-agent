@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import time
 import uuid
@@ -419,19 +420,40 @@ def build_llm_data_payload(
                 f"pod_phase_counts={json.dumps(prom['pod_phase_counts'])}"
             )
 
+        # Saturation-warning threshold (usage / declared limit). Domain-agnostic:
+        # we judge each pod against the limit its operator already declared.
+        try:
+            sat_warn = float(os.getenv("PROM_SATURATION_WARN", "0.8"))
+        except ValueError:
+            sat_warn = 0.8
+
+        def _fmt_sat(p: Dict[str, Any], unit: str) -> str:
+            """Render one pod row with limit + saturation glyph if available."""
+            sat = p.get("saturation")
+            limit = p.get("limit")
+            base = f"  - {p['pod']}: {p['value']:.3f}{unit}"
+            if sat is None or limit is None:
+                return base + " (no declared limit)"
+            line = f"{base} / limit {limit:.3f}{unit} = {sat*100:.0f}% saturation"
+            if sat > sat_warn:
+                line += f"  \u26a0\ufe0f >{int(sat_warn*100)}% saturation"
+            return line
+
         cpu_top = prom.get("cpu_per_pod_top", [])
         if cpu_top:
-            prom_lines.append("Top CPU pods (cores):")
+            prom_lines.append(
+                f"Top CPU pods (cores) [warn>{int(sat_warn*100)}% of declared limit]:"
+            )
             for p in cpu_top[:5]:
-                flag = "  \u26a0\ufe0f >0.5" if p["value"] > 0.5 else ""
-                prom_lines.append(f"  - {p['pod']}: {p['value']:.3f}{flag}")
+                prom_lines.append(_fmt_sat(p, " cores"))
 
         mem_top = prom.get("memory_per_pod_top_mb", [])
         if mem_top:
-            prom_lines.append("Top memory pods (MB):")
+            prom_lines.append(
+                f"Top memory pods (MB) [warn>{int(sat_warn*100)}% of declared limit]:"
+            )
             for p in mem_top[:5]:
-                flag = "  \u26a0\ufe0f >500MB" if p["value"] > 500 else ""
-                prom_lines.append(f"  - {p['pod']}: {p['value']:.1f}{flag}")
+                prom_lines.append(_fmt_sat(p, " MB"))
 
         restarting = prom.get("restarting_pods", [])
         if restarting:

@@ -147,6 +147,27 @@ def get_prometheus_tool_calls(
             )},
             "network_rx_per_pod",
         ),
+        # Declared CPU limit per pod (cores). Used to compute saturation
+        # = usage / limit. Domain-agnostic anomaly detection.
+        (
+            "execute_query",
+            {"query": (
+                f'sum by (pod) ('
+                f'kube_pod_container_resource_limits{{namespace="{ns}",resource="cpu"}}'
+                f')'
+            )},
+            "cpu_limit_per_pod",
+        ),
+        # Declared memory limit per pod (bytes).
+        (
+            "execute_query",
+            {"query": (
+                f'sum by (pod) ('
+                f'kube_pod_container_resource_limits{{namespace="{ns}",resource="memory"}}'
+                f')'
+            )},
+            "memory_limit_per_pod",
+        ),
     ]
 
 

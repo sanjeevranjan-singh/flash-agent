@@ -136,3 +136,57 @@ CRITICAL RULES
 5. Output MUST be valid JSON conforming to the schema - no markdown fences.
 6. Do not report transient scheduling events (e.g. one-off Normal Pulled/Started)
    as issues. Focus on symptoms indicating degradation or failure.
+
+---------------------------------------------------------------------------------------
+PROMETHEUS METRICS RUBRIC (MANDATORY when a "## METRICS (Prometheus, ...)" section exists)
+---------------------------------------------------------------------------------------
+The METRICS section may show, for each top pod, a line of the form:
+
+    - <pod>: <usage> cores / limit <X> cores = <Y>% saturation  ⚠️ >80% saturation
+
+The "⚠️" glyph means the pod is using more than the configured fraction of its OWN
+declared resource limit (the limit set by whoever deployed it). This is a direct
+signal of resource exhaustion against the operator-declared envelope; it is NOT
+a fault label and the agent does not know whether a chaos experiment caused it.
+
+Treat the glyph as evidence the same way you treat a Kubernetes warning event:
+
+  P1. health_status MUST be at least "Degraded" if ANY pod row carries a ⚠️ glyph.
+      A pod close to its declared limit is by definition not "Healthy" - the
+      operator chose that limit as the safe ceiling.
+
+  P2. For each ⚠️ pod you MUST emit an entry in identified_issues:
+        - issue_name:
+            "cpu-saturation"     when the glyph is on a "Top CPU pods" line
+            "memory-saturation"  when the glyph is on a "Top memory pods" line
+        - severity:
+            "warning"   if saturation is between the warn threshold and 95%
+            "critical"  if saturation >= 95%, or if the pod also appears with restarts
+        - affected_component: the exact pod name on that line
+        - status: "active"
+        - root_cause: cite the actual numbers verbatim, e.g.
+            "CPU usage 0.42 cores reaches 87% of declared limit 0.5 cores (Prometheus)"
+            "memory usage 612.4 MB reaches 92% of declared limit 666.0 MB (Prometheus)"
+        - detected_at_sec: 0    (the metric IS the current sample)
+        - mitigated_at_sec: null
+
+  P3. Pods listed under "Pods with restarts (cumulative):" with a non-zero count
+      MUST also appear in identified_issues as "pod-restart" (severity "warning",
+      or "critical" if restart count >= 3). health_status MUST be at least
+      "Degraded".
+
+  P4. overall_health_score MUST be:
+        <= 70 when any single ⚠️ glyph is present
+        <= 50 when multiple ⚠️ glyphs OR any restart pod is present
+        <= 30 when any "critical" severity issue is emitted
+
+  P5. Pods marked "(no declared limit)" lack the data needed for saturation
+      analysis - do not flag them based on raw values alone. Use restart count,
+      logs, and warning events to judge those pods.
+
+  P6. The Prometheus rubric is independent of Kubernetes events and logs. A
+      scan with NO warning events but WITH a ⚠️ glyph is still Degraded. A scan
+      with warning events but NO glyph is judged on the events alone.
+
+The metric values printed in the METRICS section ARE evidence and you may quote
+them verbatim as root_cause without violating the "no fabrication" rule.
