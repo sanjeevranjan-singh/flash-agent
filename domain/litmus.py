@@ -101,22 +101,45 @@ def get_prometheus_tool_calls(
             {"query": f'count(kube_pod_info{{namespace="{ns}"}})'},
             "pod_count",
         ),
-        # CPU rate per pod (cores), 1-minute window
+        # CPU rate per pod (cores), 1-minute window.
+        #
+        # cAdvisor emits two possible series shapes per pod:
+        #   (A) per-container series with `container=<name>`, `image=<ref>`
+        #       e.g. {pod="carts", container="carts", image="weaveworksdemos/carts"}
+        #   (B) pod-aggregate series with `container=""`, `image=""`
+        #       e.g. {pod="carts", container="", image="", cpu="total"}
+        #
+        # Production clusters running kube-prometheus-stack typically emit
+        # both. Minikube/dev clusters often emit only (B). The kube-
+        # prometheus-stack standard is `image!="", container!="POD"` which
+        # selects (A) and excludes the pause container; if (A) is absent
+        # this returns empty.
+        #
+        # We use PromQL `or` to fall back from (A) to (B), giving correct
+        # results on any cluster shape without double-counting.
         (
             "execute_query",
             {"query": (
                 f'sum by (pod) ('
-                f'rate(container_cpu_usage_seconds_total{{namespace="{ns}",container!=""}}[1m])'
+                f'rate(container_cpu_usage_seconds_total{{namespace="{ns}",image!="",container!="POD"}}[1m])'
+                f')'
+                f' or '
+                f'sum by (pod) ('
+                f'rate(container_cpu_usage_seconds_total{{namespace="{ns}",container=""}}[1m])'
                 f')'
             )},
             "cpu_per_pod",
         ),
-        # Memory working set per pod (bytes)
+        # Memory working set per pod (bytes) — same dual-shape handling.
         (
             "execute_query",
             {"query": (
                 f'sum by (pod) ('
-                f'container_memory_working_set_bytes{{namespace="{ns}",container!=""}}'
+                f'container_memory_working_set_bytes{{namespace="{ns}",image!="",container!="POD"}}'
+                f')'
+                f' or '
+                f'sum by (pod) ('
+                f'container_memory_working_set_bytes{{namespace="{ns}",container=""}}'
                 f')'
             )},
             "memory_per_pod",
