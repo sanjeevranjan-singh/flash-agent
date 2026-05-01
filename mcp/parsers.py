@@ -115,6 +115,69 @@ def extract_active_pod_names(
     return result
 
 
+def split_event_blocks(events_text: str) -> List[List[str]]:
+    """
+    Split MCP events_list output into one logical block per event.
+
+    Handles three shapes returned by kubernetes-mcp-server:
+      (A) YAML-list shape (most common): each event is a list item that begins
+          with a line starting with "- " at column 0; subsequent fields are
+          indented (e.g. "  Reason: Unhealthy"). NO blank lines between items.
+      (B) Blank-line separated YAML-ish blocks.
+      (C) kubectl-style table: one line per event with TYPE/REASON/OBJECT/MSG.
+
+    Previously, only (B) and (C) were handled. The live cluster returns (A),
+    so the splitter saw every "Reason:", "Type:", "Message:" line as its OWN
+    one-line "block" and the warning detection only matched isolated
+    "Type: Warning" lines while their Reason/Message lived in different blocks.
+    """
+    raw = (events_text or "").strip()
+    if not raw:
+        return []
+
+    lines = raw.splitlines()
+
+    # Detect YAML-list shape: any line starts with "- " at col 0 (and is not the
+    # leading "# ..." comment that some MCP servers prepend).
+    yaml_list_idx = [
+        i for i, l in enumerate(lines) if l.startswith("- ")
+    ]
+    if yaml_list_idx:
+        blocks: List[List[str]] = []
+        current: List[str] = []
+        for line in lines:
+            if not line.strip() or line.lstrip().startswith("#"):
+                continue
+            if line.startswith("- "):
+                if current:
+                    blocks.append(current)
+                current = [line]
+            else:
+                if current:
+                    current.append(line)
+                # else: stray pre-amble, skip
+        if current:
+            blocks.append(current)
+        return blocks
+
+    # Blank-line separated blocks
+    if "\n\n" in raw:
+        blocks = []
+        for chunk in raw.split("\n\n"):
+            block = [l for l in chunk.splitlines() if l.strip()]
+            if block:
+                blocks.append(block)
+        return blocks
+
+    # Table shape: one line per event
+    blocks = []
+    for line in lines:
+        if not line.strip() or line.startswith("NAMESPACE") or line.lstrip().startswith("#"):
+            continue
+        blocks.append([line])
+    return blocks
+
+
 def build_mcp_data_summary(response_payload: Dict[str, Any], include_chaos: bool = True) -> Dict[str, Any]:
     """
     Build a compact structured summary of the MCP response data.
@@ -186,24 +249,11 @@ def build_mcp_data_summary(response_payload: Dict[str, Any], include_chaos: bool
             warning_count = 0
             warning_reasons: List[str] = []
 
-            # Split into blocks: blank-line separator first, otherwise treat
-            # each non-header line as its own one-line block (table shape).
-            raw = events_text.strip()
-            blocks: List[List[str]] = []
-            if "\n\n" in raw:
-                for chunk in raw.split("\n\n"):
-                    lines = [l for l in chunk.splitlines() if l.strip()]
-                    if lines:
-                        blocks.append(lines)
-            else:
-                for line in raw.splitlines():
-                    if line.startswith("NAMESPACE") or not line.strip():
-                        continue
-                    blocks.append([line])
+            blocks = split_event_blocks(events_text)
 
             for block in blocks:
                 joined = "\n".join(block)
-                # Classify Warning vs Normal at block scope (handles both shapes)
+                # Classify Warning vs Normal at block scope (handles all shapes)
                 is_warning = bool(re.search(r"\bType\s*:\s*Warning\b", joined)) \
                              or "Warning" in block[0]
                 is_normal  = bool(re.search(r"\bType\s*:\s*Normal\b", joined)) \

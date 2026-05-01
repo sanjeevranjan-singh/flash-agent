@@ -21,7 +21,7 @@ from typing import Any, Dict, List, Optional
 from openai import OpenAI
 
 from config import AgentConfig
-from mcp.parsers import build_mcp_data_summary, extract_mcp_text
+from mcp.parsers import build_mcp_data_summary, extract_mcp_text, split_event_blocks
 from observability.langfuse import update_generation_metadata
 
 logger = logging.getLogger("flash-agent")
@@ -400,27 +400,15 @@ def build_llm_data_payload(
         # block so Reason and Message reach the LLM.
         events_text = extract_mcp_text(mcp_data.get("data", mcp_data).get("events_list", {}))
         if events_text:
-            raw_evt = events_text.strip()
             warning_blocks: List[str] = []
-
-            if "\n\n" in raw_evt:
-                # YAML-ish blocks separated by blank lines
-                for chunk in raw_evt.split("\n\n"):
-                    lines = [l for l in chunk.splitlines() if l.strip()]
-                    if not lines:
-                        continue
-                    block_text = "\n".join(lines)
-                    if re.search(r"\bType\s*:\s*Warning\b", block_text) \
-                       or (lines[0].strip().startswith("Type:") is False
-                           and "Warning" in lines[0]):
-                        warning_blocks.append(block_text)
-            else:
-                # kubectl-table shape – one line per event
-                for line in raw_evt.splitlines():
-                    if not line.strip() or line.startswith("NAMESPACE"):
-                        continue
-                    if "Warning" in line:
-                        warning_blocks.append(line.strip())
+            for block in split_event_blocks(events_text):
+                if not block:
+                    continue
+                block_text = "\n".join(block)
+                is_warning = bool(re.search(r"\bType\s*:\s*Warning\b", block_text)) \
+                             or (block[0].startswith("- ") is False and "Warning" in block[0])
+                if is_warning:
+                    warning_blocks.append(block_text)
 
             if warning_blocks:
                 kept = warning_blocks[-10:]
