@@ -848,35 +848,35 @@ def request_llm_analysis(
             json_text = json_text.split("```", 1)[1].split("```", 1)[0]
         result = json.loads(json_text.strip())
 
-        # Log experiment summary
-        exp = result.get("experiment_summary", {})
-        faults = result.get("chaos_faults", [])
-        wf_errors = result.get("workflow_errors", [])
+        # Log analysis summary using current schema (environment_state +
+        # identified_issues + system_errors + health). Legacy chaos_faults /
+        # experiment_summary / workflow_errors fields are no longer emitted
+        # by the prompt — flash-agent reports observation-grade signals,
+        # not workflow verdicts.
+        env_state = result.get("environment_state", {})
+        issues = result.get("identified_issues", []) or []
+        sys_errors = result.get("system_errors", []) or []
         logger.info(
             "LLM Gateway \u2192 Agent: analysis complete | "
-            "workflow=%s phase=%s | faults: %d passed, %d failed | "
-            "workflow_errors=%d | issues=%d | health=%s",
-            exp.get("workflow_name", "N/A"),
-            exp.get("workflow_phase", "N/A"),
-            exp.get("faults_passed", 0),
-            exp.get("faults_failed", 0),
-            len(wf_errors),
-            len(result.get("issues", [])),
+            "health_status=%s | score=%s | issues=%d | system_errors=%d",
+            env_state.get("health_status", "N/A"),
             result.get("health", {}).get("overall_health_score", "N/A"),
+            len(issues),
+            len(sys_errors),
         )
-        for f in faults:
-            v_icon = (
-                "\u2705"
-                if f.get("verdict") == "Pass"
-                else "\u274c" if f.get("verdict") == "Fail" else "\u23f3"
+        for issue in issues:
+            sev = str(issue.get("severity", "?")).upper()
+            sev_icon = (
+                "\u274c" if sev == "CRITICAL"
+                else "\u26a0" if sev == "WARNING"
+                else "\u2139"
             )
             logger.info(
-                "  %s %s \u2192 %s | probe=%s%% | impact: %s",
-                v_icon,
-                f.get("fault_name", "?"),
-                f.get("verdict", "?"),
-                f.get("probe_success_percentage", "?"),
-                (f.get("impact_observed", "N/A") or "N/A")[:80],
+                "  %s [%s] %s \u2192 %s",
+                sev_icon,
+                sev,
+                issue.get("affected_component", "?"),
+                (issue.get("issue_name", "") or "")[:80],
             )
     except json.JSONDecodeError as exc:
         logger.error("LLM returned invalid JSON: %s", exc)
@@ -899,9 +899,12 @@ def request_llm_analysis(
         except Exception:
             _post_meta["cached_tokens"] = 0
     if result:
-        _exp = result.get("experiment_summary", {})
-        _post_meta["faults_passed"] = _exp.get("faults_passed", 0)
-        _post_meta["faults_failed"] = _exp.get("faults_failed", 0)
+        _post_meta["issues_count"] = len(
+            result.get("identified_issues", []) or []
+        )
+        _env = result.get("environment_state", {}) or {}
+        if _env.get("health_status"):
+            _post_meta["health_status"] = _env["health_status"]
     if _post_meta:
         update_generation_metadata(cfg, _gen_id, _post_meta)
 

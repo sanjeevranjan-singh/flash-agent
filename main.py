@@ -110,10 +110,7 @@ def main() -> None:
                     env_state = analysis.get("environment_state", {}) or {}
                     health = analysis.get("health", {}) or {}
                     health_status = env_state.get("health_status", "Healthy")
-                    score = health.get(
-                        "overall_health_score",
-                        env_state.get("overall_health_score", 100),
-                    )
+                    score = health.get("overall_health_score", 100)
                     try:
                         score = int(score)
                     except (ValueError, TypeError):

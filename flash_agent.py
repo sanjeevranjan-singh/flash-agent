@@ -240,7 +240,7 @@ class FlashAgent:
 
         if analysis is None:
             logger.error("LLM analysis failed \u2013 returning empty result")
-            return {"health": {"overall_health_score": -1}, "issues": []}
+            return {"health": {"overall_health_score": -1}, "identified_issues": []}
 
         # ── Inject experiment IDs from MCP Phase 3 ───────────────────────────
         mcp_inner_ids = mcp_data.get("data", {})
@@ -256,10 +256,6 @@ class FlashAgent:
                 "subject": workflow_ids.get("subject", ""),
                 "workflow_name": workflow_ids.get("workflow_name", ""),
             }
-            exp_summary = analysis.get("experiment_summary", {})
-            if exp_summary:
-                exp_summary["experiment_id"] = experiment_id
-                exp_summary["experiment_run_id"] = experiment_run_id
             logger.info(
                 "Injected experiment IDs: experiment_id=%s experiment_run_id=%s",
                 experiment_id or "N/A",
@@ -275,24 +271,25 @@ class FlashAgent:
 
         # ── Human-readable summary ───────────────────────────────────────────
         health = analysis.get("health", {})
-        issues = analysis.get("issues", [])
+        env_state = analysis.get("environment_state", {})
+        issues = analysis.get("identified_issues", []) or []
         logger.info(
             "\u2550\u2550\u2550 Scan complete | scan_id=%s | %.1fs | server=%s | "
-            "health=%s | issues=%d | pods=%s \u2550\u2550\u2550",
+            "health=%s score=%s | issues=%d | pods=%s \u2550\u2550\u2550",
             scan_id,
             duration,
             server_type,
+            env_state.get("health_status", "?"),
             health.get("overall_health_score", "?"),
             len(issues),
-            health.get("total_pods", 0) or 0,
+            health.get("total_instances", 0) or 0,
         )
         for issue in issues:
             logger.info(
-                "  [%s] %s/%s \u2014 %s",
-                issue.get("severity", "?").upper(),
-                issue.get("affected_pod", "?"),
-                issue.get("affected_container", "?"),
-                issue.get("summary", ""),
+                "  [%s] %s \u2014 %s",
+                str(issue.get("severity", "?")).upper(),
+                issue.get("affected_component", "?"),
+                issue.get("issue_name", ""),
             )
 
         return analysis
