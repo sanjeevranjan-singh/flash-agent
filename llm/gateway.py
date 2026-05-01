@@ -22,6 +22,7 @@ from openai import OpenAI
 
 from config import AgentConfig
 from mcp.parsers import build_mcp_data_summary, extract_mcp_text, split_event_blocks
+from mcp.log_dedup import greedy_compress_lines
 from observability.langfuse import update_generation_metadata
 
 logger = logging.getLogger("flash-agent")
@@ -106,6 +107,7 @@ def _build_structured_analysis_user_content(
     """Build explicit sectioned user payload for better instruction adherence."""
     pods = summary.get("pods", {})
     events = summary.get("events", {})
+    topology = summary.get("topology", {}) or {}
     context = agent_context or {}
 
     sections: List[str] = [
@@ -114,6 +116,65 @@ def _build_structured_analysis_user_content(
         f"- Data Source: {server_type.upper()} MCP",
         f"- Scan ID: {scan_id or 'N/A'}",
         f"- Data Sufficient: {context.get('data_sufficient', True)}",
+    ]
+
+    # Detection-gate precommit (AIOpsLab cascade pattern).
+    # When the cheaper Detection stage already classified the snapshot as
+    # anomalous, surface that decision so the broader analysis cannot
+    # contradict it without explicit reasoning. This reduces under-reporting
+    # without prescribing what the issue is.
+    det_verdict = context.get("detection_gate")
+    det_reason = context.get("detection_reason")
+    if det_verdict:
+        sections.append(
+            f"- Detection Gate: anomaly_detected={det_verdict}"
+            + (f" | evidence={det_reason!r}" if det_reason else "")
+        )
+        if det_verdict == "Yes":
+            sections.append(
+                "- NOTE: A separate detection pass already classified this "
+                "snapshot as anomalous. health_status MUST NOT be 'Healthy' "
+                "and identified_issues MUST contain at least one entry "
+                "consistent with the evidence above."
+            )
+
+    # Topology: deployment-grouped pod inventory derived from observed pods.
+    # Provides peer-set context for outlier detection (Channel C/F in
+    # analysis prompt) without leaking fault identity. Excludes the agent's
+    # own deployment so it cannot self-describe.
+    if topology:
+        topo_lines: List[str] = []
+        # Hide the agent itself + chaos infra from the topology view: a real
+        # SRE on-call would not consider their own monitoring sidecar a peer
+        # of the workload, and chaos infra components must never reach the
+        # LLM (blind-observer rule).
+        _HIDE = {
+            "flash-agent", "litellm", "litellm-proxy",
+            "chaos-exporter", "chaos-operator", "chaos-runner",
+            "subscriber", "event-tracker", "workflow-controller",
+            "kubernetes-mcp-server", "prometheus-mcp-server",
+        }
+        for deploy in sorted(topology.keys()):
+            if deploy in _HIDE or deploy.startswith("chaos-") or "-runner" in deploy:
+                continue
+            t = topology[deploy]
+            ages = t.get("ages") or []
+            age_summary = ""
+            if ages:
+                # Show min..max age and the youngest/oldest pod age separately
+                # so age-skew (Channel C in prompt) is computable directly.
+                age_summary = f" ages={ages[0] if len(ages)==1 else f'{min(ages, key=len)}..{max(ages, key=len)}'}"
+            stat_summary = ",".join(
+                f"{s}={n}" for s, n in sorted(t.get("statuses", {}).items())
+            )
+            topo_lines.append(
+                f"  - {deploy}: pods={t['pods']} ready={t['ready']}/{t['pods']} "
+                f"restarts={t['restarts']} status={{{stat_summary}}}{age_summary}"
+            )
+        sections.append("TOPOLOGY (deployments observed in namespace)")
+        sections.extend(topo_lines)
+
+    sections.extend([
         "",
         "METRICS",
         f"- Pods total: {pods.get('total', 0)}",
@@ -131,7 +192,7 @@ def _build_structured_analysis_user_content(
         "- Analyze only the provided evidence.",
         "- Do not infer fault identity unless explicitly evidenced in logs/metrics.",
         "- Preserve strict JSON response schema from system prompt.",
-    ]
+    ])
 
     if not context.get("data_sufficient", True) and context.get("data_quality_note"):
         sections.extend(
@@ -341,6 +402,93 @@ def request_hindsight_check(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# STEP 2c – Detection Gate (AIOpsLab-style binary anomaly detection)
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+def request_detection_gate(
+    cfg: AgentConfig,
+    mcp_data: Dict[str, Any],
+    server_type: str,
+    scan_id: str = "",
+) -> Dict[str, Any]:
+    """
+    Cheap binary anomaly check before the full structured analysis.
+
+    Mirrors AIOpsLab's DetectionTask (clients/gpt.py + tasks/detection.py):
+    a small, focused prompt that asks "is anything anomalous here?" and
+    expects a Yes/No answer with a one-line justification. Splitting the
+    cognitive load improves under-detection: the broad analysis prompt
+    sometimes returns issues=0 because the LLM hedges; the gate poses the
+    simpler question first and biases toward investigation when ANY single
+    evidence channel fires.
+
+    Returns {"anomaly_detected": "Yes"|"No", "reason": "<phrase>"}.
+    On any failure, defaults to {"anomaly_detected": "Yes"} so the full
+    analysis still runs (fail-open — never miss a real incident).
+    """
+    detection_prompt = _load_prompt("detection")
+    summary = build_mcp_data_summary(mcp_data, include_chaos=cfg.include_chaos_tools)
+    # Compact summary only — gate is intentionally cheap. We send the same
+    # blind-observer fields the full analysis sees, but no raw log dumps.
+    keep = {
+        "pods": summary.get("pods", {}),
+        "topology": summary.get("topology", {}),
+        "events": summary.get("events", {}),
+        "prometheus": summary.get("prometheus", {}),
+    }
+    summary_text = json.dumps(keep, indent=2, default=str)
+    summary_text, _leaked = _sanitize_leakage_terms(summary_text)
+
+    messages: List[Dict[str, str]] = [
+        {"role": "system", "content": detection_prompt},
+        {"role": "user", "content": f"OBSERVATION SNAPSHOT:\n{summary_text}"},
+    ]
+
+    try:
+        resp = _chat_create(
+            create_openai_client(cfg),
+            cfg.model_alias,
+            150,
+            model=cfg.model_alias,
+            messages=messages,
+            temperature=0,
+            extra_body={
+                "metadata": {
+                    "trace_id": cfg.notify_id or scan_id,
+                    "session_id": scan_id,
+                    "generation_name": "detection_gate",
+                    "scan_id": scan_id,
+                    "step": "detection",
+                    "namespace": cfg.k8s_namespace,
+                    "agent": cfg.agent_name,
+                }
+            },
+        )
+        raw = (resp.choices[0].message.content or "").strip()
+        if "```json" in raw:
+            raw = raw.split("```json", 1)[1].split("```", 1)[0]
+        elif "```" in raw:
+            raw = raw.split("```", 1)[1].split("```", 1)[0]
+        result = json.loads(raw.strip())
+        ans = str(result.get("anomaly_detected", "")).strip().lower()
+        normalised = "Yes" if ans in ("yes", "true", "1") else "No"
+        result["anomaly_detected"] = normalised
+        logger.info(
+            "Detection gate: anomaly=%s | reason=%s",
+            normalised,
+            result.get("reason", ""),
+        )
+        return result
+    except Exception as exc:
+        logger.warning(
+            "Detection gate failed (%s) – defaulting to anomaly=Yes (fail-open)",
+            exc,
+        )
+        return {"anomaly_detected": "Yes", "reason": "detection-gate-error"}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # STEP 3 – LLM Data Payload Builder
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -400,6 +548,7 @@ def build_llm_data_payload(
         # block so Reason and Message reach the LLM.
         events_text = extract_mcp_text(mcp_data.get("data", mcp_data).get("events_list", {}))
         if events_text:
+            events_text = greedy_compress_lines(events_text)
             warning_blocks: List[str] = []
             for block in split_event_blocks(events_text):
                 if not block:
@@ -430,72 +579,30 @@ def build_llm_data_payload(
                 f"pod_phase_counts={json.dumps(prom['pod_phase_counts'])}"
             )
 
-        # Saturation thresholds – domain-agnostic, configurable.
-        # PROM_SATURATION_WARN: usage / declared limit (when limit exists)
-        # PROM_CPU_ABS_WARN_CORES + PROM_MEM_ABS_WARN_MB: absolute fallback for
-        # workloads that do not declare resource limits (e.g. sock-shop demo
-        # apps).  Without a fallback every chaos cpu-hog / memory-hog scan is
-        # silently skipped because every pod row is tagged "(no declared limit)".
-        try:
-            sat_warn = float(os.getenv("PROM_SATURATION_WARN", "0.8"))
-        except ValueError:
-            sat_warn = 0.8
-        try:
-            cpu_abs_warn  = float(os.getenv("PROM_CPU_ABS_WARN_CORES", "0.5"))
-            cpu_abs_crit  = float(os.getenv("PROM_CPU_ABS_CRIT_CORES", "1.5"))
-            mem_abs_warn  = float(os.getenv("PROM_MEM_ABS_WARN_MB",   "256"))
-            mem_abs_crit  = float(os.getenv("PROM_MEM_ABS_CRIT_MB",   "1024"))
-        except ValueError:
-            cpu_abs_warn, cpu_abs_crit = 0.5, 1.5
-            mem_abs_warn, mem_abs_crit = 256.0, 1024.0
-
-        def _fmt_sat(p: Dict[str, Any], unit: str) -> str:
-            """Render one pod row with limit + saturation glyph if available.
-
-            When the workload declares a resource limit, use saturation
-            (usage / limit) and warn at PROM_SATURATION_WARN.  When no limit
-            is declared, fall back to absolute-value thresholds so cpu-hog /
-            memory-hog faults are still visible to the LLM.
-            """
-            sat = p.get("saturation")
-            limit = p.get("limit")
+        # Render raw per-pod metric rows. The agent reasons about anomalies
+        # (peer outliers, trends, non-zero restart counts) directly from the
+        # raw values — no precomputed saturation glyph or absolute-threshold
+        # marker is injected. This matches the AIOpsLab observation model:
+        # the agent gets telemetry, not preconcluded verdicts.
+        def _fmt_raw(p: Dict[str, Any], unit: str) -> str:
             value = p["value"]
+            limit = p.get("limit")
             base = f"  - {p['pod']}: {value:.3f}{unit}"
-            if sat is not None and limit is not None:
-                line = f"{base} / limit {limit:.3f}{unit} = {sat*100:.0f}% saturation"
-                if sat > sat_warn:
-                    line += f"  \u26a0\ufe0f >{int(sat_warn*100)}% saturation"
-                return line
-
-            # No declared limit – use absolute thresholds. The thresholds are
-            # generic SRE rules of thumb (cpu > 0.5 cores or mem > 256 MB on a
-            # baseline microservice indicates pressure).
-            is_cpu = "core" in unit
-            warn_thr = cpu_abs_warn if is_cpu else mem_abs_warn
-            crit_thr = cpu_abs_crit if is_cpu else mem_abs_crit
-            metric_label = "CPU" if is_cpu else "memory"
-            line = f"{base} (no declared limit)"
-            if value >= crit_thr:
-                line += f"  \u26a0\ufe0f {metric_label} >= {crit_thr:g}{unit} (critical absolute load)"
-            elif value >= warn_thr:
-                line += f"  \u26a0\ufe0f {metric_label} >= {warn_thr:g}{unit} (elevated absolute load)"
-            return line
+            if limit is not None:
+                base += f" (declared limit {limit:.3f}{unit})"
+            return base
 
         cpu_top = prom.get("cpu_per_pod_top", [])
         if cpu_top:
-            prom_lines.append(
-                f"Top CPU pods (cores) [warn>{int(sat_warn*100)}% of declared limit]:"
-            )
+            prom_lines.append("Top CPU pods (cores, current rate):")
             for p in cpu_top[:5]:
-                prom_lines.append(_fmt_sat(p, " cores"))
+                prom_lines.append(_fmt_raw(p, " cores"))
 
         mem_top = prom.get("memory_per_pod_top_mb", [])
         if mem_top:
-            prom_lines.append(
-                f"Top memory pods (MB) [warn>{int(sat_warn*100)}% of declared limit]:"
-            )
+            prom_lines.append("Top memory pods (MB, working set):")
             for p in mem_top[:5]:
-                prom_lines.append(_fmt_sat(p, " MB"))
+                prom_lines.append(_fmt_raw(p, " MB"))
 
         restarting = prom.get("restarting_pods", [])
         if restarting:
@@ -558,6 +665,7 @@ def build_llm_data_payload(
                 if "chaos-exporter" in pod_name:
                     log_text = extract_mcp_text(log_data)
                     if log_text:
+                        log_text = greedy_compress_lines(log_text)
                         verdict_lines = [
                             l.strip()
                             for l in log_text.split("\n")
@@ -582,6 +690,7 @@ def build_llm_data_payload(
                 if "chaos-operator" in pod_name:
                     log_text = extract_mcp_text(log_data)
                     if log_text:
+                        log_text = greedy_compress_lines(log_text)
                         sections.append(
                             f"## CHAOS-OPERATOR LOGS ({pod_name})\n"
                             + log_text[-2000:]
@@ -599,6 +708,7 @@ def build_llm_data_payload(
             log_text = extract_mcp_text(log_data)
             if not log_text or not log_text.strip():
                 continue
+            log_text = greedy_compress_lines(log_text)
             lines = [l.strip() for l in log_text.strip().split("\n") if l.strip()]
             # Prioritise diagnostic lines (errors, kills, OOM, restarts)
             diag_keywords = (

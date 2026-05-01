@@ -32,7 +32,12 @@ from domain.litmus import (
     get_prometheus_tool_calls,
     parse_workflow_phase_from_text,
 )
-from llm.gateway import request_llm_analysis, request_tool_selection, request_hindsight_check
+from llm.gateway import (
+    request_llm_analysis,
+    request_tool_selection,
+    request_hindsight_check,
+    request_detection_gate,
+)
 from mcp.client import MCPClient, generate_fallback_data
 from mcp.parsers import build_mcp_data_summary, extract_active_pod_names
 from observability.mcp_logger import persist_mcp_interaction
@@ -194,14 +199,44 @@ class FlashAgent:
                 agent_context["data_quality_note"],
             )
 
-        # ── Step 3: LLM Analysis ────────────────────────────────────────────
-        analysis = request_llm_analysis(
+        # ── Step 2c: Detection gate (AIOpsLab-style binary check) ──────────
+        # Cheap binary anomaly check on the same blind-observer data. Fail-open:
+        # if the gate says "No" we still run full analysis to satisfy the
+        # certifier-trace requirement, but we record the gate verdict for
+        # telemetry. The gate's main value is making the broader analysis
+        # less likely to under-report when ANY single evidence channel fires.
+        detection = request_detection_gate(
             cfg=self.cfg,
             mcp_data=mcp_data,
             server_type=server_type,
             scan_id=scan_id,
-            agent_context=agent_context,
         )
+        agent_context["detection_gate"] = detection.get("anomaly_detected", "Yes")
+        agent_context["detection_reason"] = detection.get("reason", "")
+
+        # ── Step 3: LLM Analysis ────────────────────────────────────────────
+        if self.cfg.reasoning_mode == "react":
+            # Multi-turn ReAct loop (AIOpsLab clients/gpt.py pattern). The
+            # LLM iteratively chooses observation tools and submits a final
+            # verdict via submit(). Same JSON schema as single-shot so all
+            # downstream code is unchanged. 5-10x token cost; opt-in only.
+            from llm.react_loop import request_react_analysis
+            logger.info(
+                "Running ReAct analysis (max_steps=%d)", self.cfg.react_max_steps
+            )
+            analysis = request_react_analysis(
+                cfg=self.cfg,
+                scan_id=scan_id,
+                agent_context=agent_context,
+            )
+        else:
+            analysis = request_llm_analysis(
+                cfg=self.cfg,
+                mcp_data=mcp_data,
+                server_type=server_type,
+                scan_id=scan_id,
+                agent_context=agent_context,
+            )
 
         if analysis is None:
             logger.error("LLM analysis failed \u2013 returning empty result")

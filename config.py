@@ -61,6 +61,14 @@ class AgentConfig:
     scan_health_threshold: int    # overall_health_score below this counts as 'fault window'
     scan_query: str
 
+    # Reasoning mode ("single-shot" or "react"). single-shot pre-fetches
+    # all MCP data and runs one analysis call. react opts into a multi-turn
+    # tool-calling loop modeled on AIOpsLab where the LLM iteratively chooses
+    # which observation tool to call next. ReAct costs 5-10x tokens per scan
+    # so it is opt-in; default is single-shot.
+    reasoning_mode: str
+    react_max_steps: int
+
     # Experiment identity – injected by sidecar at runtime
     notify_id: str          # = experiment_run_id / Langfuse trace_id
 
@@ -107,6 +115,8 @@ class AgentConfig:
                 f"namespace '{k8s_namespace}'. "
                 "Identify pod failures, restarts, resource pressure, and anomalies.",
             ),
+            reasoning_mode=os.getenv("AGENT_REASONING_MODE", "single-shot").strip().lower(),
+            react_max_steps=int(os.getenv("AGENT_REACT_MAX_STEPS", "8")),
             notify_id=os.getenv("NOTIFY_ID", ""),
             langfuse_host=os.getenv("LANGFUSE_HOST", ""),
             langfuse_public_key=os.getenv("LANGFUSE_PUBLIC_KEY", ""),

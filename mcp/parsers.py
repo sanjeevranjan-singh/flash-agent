@@ -204,23 +204,67 @@ def build_mcp_data_summary(response_payload: Dict[str, Any], include_chaos: bool
         status_counts: Dict[str, int] = {}
         total_restarts = 0
         high_restart_pods: List[str] = []
+        # Topology: group pods by deployment (derived from `name=` label, or
+        # fallback to stripping the trailing -<rs-hash>-<pod-hash> from name).
+        # AIOpsLab provides a static `app_summary` to its agents; we cannot
+        # rely on a static description (any app may be deployed) so we derive
+        # topology from observed pods. Strictly observation-only: same data
+        # an SRE would see from `kubectl get pods -o wide --show-labels`.
+        topology: Dict[str, Dict[str, Any]] = {}
+
+        _DEPLOY_HASH_RE = re.compile(r"-[0-9a-f]{6,10}-[0-9a-z]{5}$")
+
+        def _deployment_of(pod_name: str, labels_blob: str) -> str:
+            # Prefer `name=<X>` label (sock-shop convention); fallback to
+            # `app.kubernetes.io/name=<X>`; final fallback is name regex strip.
+            for key in ("name=", "app.kubernetes.io/name=", "app="):
+                if key in labels_blob:
+                    val = labels_blob.split(key, 1)[1].split(",", 1)[0].strip()
+                    if val and val != "flash-agent":
+                        return val
+                    if val == "flash-agent":
+                        return val
+            stripped = _DEPLOY_HASH_RE.sub("", pod_name)
+            return stripped or pod_name
+
         for line in pods_text.strip().split("\n"):
             if line.startswith("NAMESPACE") or not line.strip():
                 continue
             parts = line.split()
-            if len(parts) >= 6:
-                pod_name = parts[3]
-                status = parts[5]
-                status_counts[status] = status_counts.get(status, 0) + 1
+            if len(parts) < 6:
+                continue
+            pod_name = parts[3] if len(parts) > 3 else ""
+            status = parts[5] if len(parts) > 5 else "Unknown"
+            status_counts[status] = status_counts.get(status, 0) + 1
+            try:
+                restarts = int(parts[6].split("(")[0]) if len(parts) > 6 else 0
+            except (ValueError, IndexError):
+                restarts = 0
+            total_restarts += restarts
+            if restarts > 0:
+                high_restart_pods.append(f"{pod_name} ({restarts})")
+            age = parts[7] if len(parts) > 7 else "?"
+            labels = parts[-1] if len(parts) > 8 else ""
+            deploy = _deployment_of(pod_name, labels)
+            d = topology.setdefault(deploy, {
+                "pods": 0, "running": 0, "ready": 0,
+                "restarts": 0, "ages": [], "statuses": {},
+            })
+            d["pods"] += 1
+            if status == "Running":
+                d["running"] += 1
+            d["restarts"] += restarts
+            d["ages"].append(age)
+            d["statuses"][status] = d["statuses"].get(status, 0) + 1
+            ready_field = parts[4] if len(parts) > 4 else "0/0"
+            if "/" in ready_field:
                 try:
-                    restarts = (
-                        int(parts[6].split("(")[0]) if len(parts) > 6 else 0
-                    )
-                    total_restarts += restarts
-                    if restarts > 0:
-                        high_restart_pods.append(f"{pod_name} ({restarts})")
-                except (ValueError, IndexError):
+                    r_now, r_total = ready_field.split("/")
+                    if r_now == r_total and int(r_total) > 0:
+                        d["ready"] += 1
+                except ValueError:
                     pass
+
         summary["pods"] = {
             "total": sum(status_counts.values()),
             "by_status": status_counts,
@@ -228,6 +272,8 @@ def build_mcp_data_summary(response_payload: Dict[str, Any], include_chaos: bool
         }
         if high_restart_pods:
             summary["pods"]["restarted_pods"] = high_restart_pods[:5]
+        if topology:
+            summary["topology"] = topology
 
     # ── events_list → event type breakdown ───────────────────────────────────
     # The MCP server can return events in two shapes:
