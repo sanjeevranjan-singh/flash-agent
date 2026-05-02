@@ -61,6 +61,11 @@ class AgentConfig:
     scan_health_threshold: int    # overall_health_score below this counts as 'fault window'
     scan_query: str
 
+    # MCP event recency window (seconds). Cold-start floor when the agent has
+    # no prior watermark, and a slack ceiling we never look beyond. Set to
+    # ~3× scan_interval so a single missed scan still recovers gracefully.
+    event_recency_fallback_sec: int
+
     # Reasoning mode ("single-shot" or "react"). single-shot pre-fetches
     # all MCP data and runs one analysis call. react opts into a multi-turn
     # tool-calling loop modeled on AIOpsLab where the LLM iteratively chooses
@@ -109,6 +114,9 @@ class AgentConfig:
             scan_interval=int(os.getenv("SCAN_INTERVAL", "0")),
             scan_interval_fast=int(os.getenv("SCAN_INTERVAL_FAST", "15")),
             scan_health_threshold=int(os.getenv("SCAN_HEALTH_THRESHOLD", "100")),
+            event_recency_fallback_sec=int(
+                os.getenv("EVENT_RECENCY_FALLBACK_SEC", "90")
+            ),
             scan_query=os.getenv(
                 "SCAN_QUERY",
                 f"Analyse the operational health of all workloads in Kubernetes "

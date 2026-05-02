@@ -14,7 +14,7 @@ import os
 import re
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -26,6 +26,25 @@ from mcp.log_dedup import greedy_compress_lines
 from observability.langfuse import update_generation_metadata
 
 logger = logging.getLogger("flash-agent")
+
+# Match the MCP event-block timestamp line. Sample:
+#   Timestamp: 2026-05-01 20:09:31 +0000 UTC
+_EVENT_TS_RE = re.compile(
+    r"Timestamp\s*:\s*(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})\s*([+-]\d{4})?\s*UTC?",
+    re.IGNORECASE,
+)
+
+
+def _parse_event_block_ts(block_text: str) -> Optional[datetime]:
+    """Best-effort parse of an event block's Timestamp line. Returns UTC dt or None."""
+    m = _EVENT_TS_RE.search(block_text)
+    if not m:
+        return None
+    try:
+        dt = datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S")
+        return dt.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
 
 
 # Structural K8s/Litmus resource-type keywords that always indicate identity leakage
@@ -250,18 +269,27 @@ def _load_prompt(name: str) -> str:
 # ──────────────────────────────────────────────────────────────────────────────
 
 
-def create_openai_client(cfg: AgentConfig) -> OpenAI:
+def create_openai_client(cfg: AgentConfig, max_retries: int = 2) -> OpenAI:
     """
     Create an OpenAI-compatible client pointed at the LiteLLM proxy.
 
     All LLM calls go through LiteLLM regardless of provider — this ensures
     Langfuse tracing, retries, and sidecar metadata injection all work.
     The proxy handles Azure/OpenAI/Anthropic routing based on its config.
+
+    The OpenAI SDK's transparent retries cause the LiteLLM proxy to emit a
+    separate Langfuse generation per HTTP attempt, inflating trace observation
+    counts and token costs. Cheap fail-open calls (detection_gate, hindsight,
+    tool_selection) pass max_retries=0 so a single failed attempt simply
+    triggers their fail-open default. The expensive llm_analysis call keeps
+    the SDK default (max_retries=2) since a transient blip there would lose
+    the entire scan's observation.
     """
     return OpenAI(
         api_key=cfg.openai_api_key or "not-needed",
         base_url=cfg.openai_base_url,
         timeout=120.0,
+        max_retries=max_retries,
     )
 
 
@@ -293,7 +321,7 @@ def request_tool_selection(
 
     try:
         resp = _chat_create(
-            create_openai_client(cfg),
+            create_openai_client(cfg, max_retries=0),
             cfg.model_alias,
             50,
             model=cfg.model_alias,
@@ -366,7 +394,7 @@ def request_hindsight_check(
 
     try:
         resp = _chat_create(
-            create_openai_client(cfg),
+            create_openai_client(cfg, max_retries=0),
             cfg.model_alias,
             100,
             model=cfg.model_alias,
@@ -447,7 +475,7 @@ def request_detection_gate(
 
     try:
         resp = _chat_create(
-            create_openai_client(cfg),
+            create_openai_client(cfg, max_retries=0),
             cfg.model_alias,
             150,
             model=cfg.model_alias,
@@ -498,6 +526,9 @@ def build_llm_data_payload(
     server_type: str,
     k8s_namespace: str,
     include_chaos: bool = True,
+    event_watermark_ts: Optional[datetime] = None,
+    event_recency_fallback_sec: int = 90,
+    gate_verdict: str = "",
 ) -> str:
     """
     Build a structured data payload for the LLM.
@@ -560,11 +591,60 @@ def build_llm_data_payload(
                     warning_blocks.append(block_text)
 
             if warning_blocks:
-                kept = warning_blocks[-10:]
-                sections.append(
-                    f"## WARNING EVENTS (latest {len(kept)})\n"
-                    + "\n---\n".join(kept)
-                )
+                # ── Recency filter (MCP event watermark) ──────────────────
+                # K8s `lastTimestamp` advances each time an event recurs, so
+                # filtering on (now - ts) <= cutoff keeps an event that is
+                # still actively firing while dropping stale "ghosts" from
+                # earlier scans. Cold-start uses the configured fallback;
+                # subsequent scans use max(watermark - 10s slack, fallback).
+                # Fail-open if every block is filtered AND the gate said
+                # "Yes": preserve the most recent 3 so the LLM still has
+                # evidence — better stale data than no data when an anomaly
+                # is asserted upstream.
+                _now = datetime.now(timezone.utc)
+                _fallback = _now - timedelta(seconds=max(1, event_recency_fallback_sec))
+                if event_watermark_ts is not None:
+                    _floor = event_watermark_ts - timedelta(seconds=10)
+                    # Never look further back than the fallback ceiling.
+                    _floor = max(_floor, _fallback)
+                else:
+                    _floor = _fallback
+
+                fresh: List[str] = []
+                undated: List[str] = []
+                for blk in warning_blocks:
+                    ts = _parse_event_block_ts(blk)
+                    if ts is None:
+                        # Unparseable timestamp → keep (fail-open at block level).
+                        undated.append(blk)
+                    elif ts >= _floor:
+                        fresh.append(blk)
+
+                filtered = fresh + undated
+                if not filtered and str(gate_verdict).lower().startswith("y"):
+                    filtered = warning_blocks[-3:]
+                    logger.info(
+                        "Watermark filter dropped all %d warning event(s); "
+                        "gate=Yes — restoring last 3 to preserve evidence",
+                        len(warning_blocks),
+                    )
+                else:
+                    dropped = len(warning_blocks) - len(filtered)
+                    if dropped > 0:
+                        logger.info(
+                            "Watermark filter: kept %d of %d warning event(s) "
+                            "(floor=%s)",
+                            len(filtered),
+                            len(warning_blocks),
+                            _floor.strftime("%H:%M:%S"),
+                        )
+
+                kept = filtered[-10:]
+                if kept:
+                    sections.append(
+                        f"## WARNING EVENTS (latest {len(kept)})\n"
+                        + "\n---\n".join(kept)
+                    )
 
     # ── 2b. Prometheus metrics snapshot ──────────────────────────────────────
     prom = summary.get("prometheus", {})
@@ -754,6 +834,7 @@ def request_llm_analysis(
     server_type: str,
     scan_id: str = "",
     agent_context: Optional[Dict[str, Any]] = None,
+    event_watermark_ts: Optional[datetime] = None,
 ) -> Optional[Dict[str, Any]]:
     """
     Send MCP data to the LLM for deep analysis.
@@ -764,6 +845,9 @@ def request_llm_analysis(
     payload_text = build_llm_data_payload(
         mcp_data, server_type, cfg.k8s_namespace,
         include_chaos=cfg.include_chaos_tools,
+        event_watermark_ts=event_watermark_ts,
+        event_recency_fallback_sec=cfg.event_recency_fallback_sec,
+        gate_verdict=(agent_context or {}).get("detection_gate", ""),
     )
     payload_summary = build_mcp_data_summary(
         mcp_data,

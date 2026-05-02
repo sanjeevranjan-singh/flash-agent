@@ -20,7 +20,7 @@ import logging
 import os
 import time
 from datetime import datetime, timezone
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import requests
 
@@ -56,6 +56,26 @@ class FlashAgent:
     def __init__(self, cfg: AgentConfig) -> None:
         self.cfg = cfg
         self._scan_counter = 0
+        # Tool selection is a function of the agent's static mission and
+        # available MCP servers; the query never changes scan-to-scan, so the
+        # LLM picks the same server every time. Memoize the first verdict and
+        # reuse it for the remainder of the agent's lifetime — saves one LLM
+        # call per scan (~120 in-tokens). Set FORCE_TOOL_SELECTION=true to
+        # opt out (e.g. for an A/B comparison run).
+        self._cached_server_type: Optional[str] = None
+        # MCP event watermark: the timestamp at the END of the previous scan.
+        # Warning-event blocks older than (watermark - 10s slack) are filtered
+        # from the analysis prompt so each scan reasons over fresh signal,
+        # not the same 6 startup-probe ghosts repeated 24 times. Cold-start
+        # (None) → fall back to (now - EVENT_RECENCY_FALLBACK_SEC).
+        self._last_event_watermark_ts: Optional[datetime] = None
+        # Track the experiment identity the watermark was advanced under.
+        # Today the agent runs as a per-experiment cronjob (fresh pod per
+        # run) so this is naturally cold every time, but if main.py is ever
+        # changed to a long-lived deployment we reset the watermark when
+        # NOTIFY_ID flips so experiment N's tail of stale events does not
+        # leak into experiment N+1's first scan.
+        self._watermark_notify_id: str = ""
 
     # ══════════════════════════════════════════════════════════════════════════
     # Public Interface (AgentInterface protocol)
@@ -109,12 +129,17 @@ class FlashAgent:
           3. Send data to LLM for deep analysis
           4. Inject experiment IDs from MCP Phase 3 into result
         """
-        # ── Step 1: Tool Selection ───────────────────────────────────────────
-        server_type = request_tool_selection(
-            cfg=self.cfg,
-            user_query=scan_query,
-            scan_id=scan_id,
-        )
+        # ── Step 1: Tool Selection (memoized after first call) ───────────────
+        if self._cached_server_type and not os.environ.get("FORCE_TOOL_SELECTION"):
+            server_type = self._cached_server_type
+            logger.debug("Tool selection memoized → %s", server_type)
+        else:
+            server_type = request_tool_selection(
+                cfg=self.cfg,
+                user_query=scan_query,
+                scan_id=scan_id,
+            )
+            self._cached_server_type = server_type
 
         # ── Step 2: MCP Data Collection ─────────────────────────────────────
         mcp_data = self._collect_mcp_data(
@@ -215,6 +240,23 @@ class FlashAgent:
         agent_context["detection_reason"] = detection.get("reason", "")
 
         # ── Step 3: LLM Analysis ────────────────────────────────────────────
+        # Snapshot the watermark BEFORE the analysis call: blocks newer than
+        # the end of the previous scan are "fresh"; older ones are filtered
+        # out (see build_llm_data_payload). We refresh the watermark to "now"
+        # only after a successful analysis so a failed scan does not silently
+        # blank out evidence on the next attempt.
+        # Reset across experiment boundaries (long-lived deployment safety).
+        current_notify_id = self.cfg.notify_id or ""
+        if current_notify_id != self._watermark_notify_id:
+            if self._last_event_watermark_ts is not None:
+                logger.info(
+                    "NOTIFY_ID changed (%s → %s) — resetting event watermark",
+                    self._watermark_notify_id or "<empty>",
+                    current_notify_id or "<empty>",
+                )
+            self._last_event_watermark_ts = None
+            self._watermark_notify_id = current_notify_id
+        scan_watermark = self._last_event_watermark_ts
         if self.cfg.reasoning_mode == "react":
             # Multi-turn ReAct loop (AIOpsLab clients/gpt.py pattern). The
             # LLM iteratively chooses observation tools and submits a final
@@ -224,6 +266,12 @@ class FlashAgent:
             logger.info(
                 "Running ReAct analysis (max_steps=%d)", self.cfg.react_max_steps
             )
+            # TODO: thread event_watermark_ts into ReAct's events_list tool
+            # call so multi-turn mode benefits from the same recency filter.
+            # Today ReAct fetches events inside the loop with no filtering;
+            # acceptable while ReAct is opt-in / unused, revisit if it goes
+            # default. See request_llm_analysis(...) for the single-shot
+            # threading pattern.
             analysis = request_react_analysis(
                 cfg=self.cfg,
                 scan_id=scan_id,
@@ -236,10 +284,23 @@ class FlashAgent:
                 server_type=server_type,
                 scan_id=scan_id,
                 agent_context=agent_context,
+                event_watermark_ts=scan_watermark,
             )
 
         if analysis is None:
-            logger.error("LLM analysis failed \u2013 returning empty result")
+            # Surface the agent_context so the operator can correlate which
+            # gate verdict / pod count / mcp duration accompanied the failure.
+            # The 2026-05-01 trace had one scan with no analysis observation
+            # and only this generic line in the logs — no diagnosable signal.
+            logger.error(
+                "LLM analysis returned None \u2014 returning empty result | "
+                "scan_id=%s | server=%s | gate=%s | pods=%s | mcp_dur=%.2fs",
+                scan_id,
+                server_type,
+                agent_context.get("detection_gate"),
+                agent_context.get("pods_total"),
+                float(agent_context.get("mcp_duration_sec") or 0.0),
+            )
             return {"health": {"overall_health_score": -1}, "identified_issues": []}
 
         # ── Inject experiment IDs from MCP Phase 3 ───────────────────────────
@@ -291,6 +352,12 @@ class FlashAgent:
                 issue.get("affected_component", "?"),
                 issue.get("issue_name", ""),
             )
+
+        # Advance MCP event watermark only after a successful scan. Next
+        # scan will filter warning blocks older than this stamp (minus 10s
+        # slack). A failed scan leaves the watermark unchanged so we don't
+        # silently blank out evidence.
+        self._last_event_watermark_ts = datetime.now(timezone.utc)
 
         return analysis
 
