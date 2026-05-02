@@ -286,6 +286,35 @@ def get_prometheus_tool_calls(
             )},
             "volume_usage_ratio",
         ),
+        # Recent restart RATE (per pod, last 5 min). Cumulative restarts_total
+        # alone misses pod-delete because the new pod's counter resets to 0.
+        # increase() on the cumulative gauge captures any restart that
+        # occurred in the window and flags the pod as recently affected
+        # regardless of whether the value is currently 0 or 1. Critical for
+        # pod-delete and any pod-recreation fault.
+        (
+            "execute_query",
+            {"query": (
+                f'sum by (pod) ('
+                f'increase(kube_pod_container_status_restarts_total'
+                f'{{namespace="{ns}"}}[5m])'
+                f') > 0'
+            )},
+            "restart_rate_per_pod",
+        ),
+        # Pods reporting Ready=false. Catches network-loss (pod still Running
+        # but readiness probes start failing because peer connectivity is
+        # broken) and any liveness/readiness probe failure that doesn't
+        # progress to CrashLoop. Emitted by kube-state-metrics independent
+        # of resource limits.
+        (
+            "execute_query",
+            {"query": (
+                f'kube_pod_status_ready'
+                f'{{namespace="{ns}",condition="false"}} == 1'
+            )},
+            "pods_not_ready",
+        ),
     ]
 
 

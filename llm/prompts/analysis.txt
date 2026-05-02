@@ -28,6 +28,13 @@ Examine the system state. You must produce:
      what the data shows (restarts, error logs, warning events, non-Running pods).
 
 2. IDENTIFIED ISSUES
+   Report EVERY distinct symptom you can confirm from the data — do NOT
+   artificially cap the list at 5. Aim for 8-15 entries when evidence
+   supports them; only return fewer if the data genuinely shows fewer
+   distinct symptoms. Each [PEER-OUTLIER] pod, each waiting reason,
+   each terminated reason, each restarting pod, each [NEAR-FULL] PVC,
+   and each error-log signature is its OWN issue entry.
+
    For each distinct symptom you can confirm from the data:
 
    - issue_name: concise identifier derived from evidence
@@ -66,12 +73,23 @@ Examine the system state. You must produce:
 
 4. OVERALL HEALTH SUMMARY
    - Instance counts, error/warning counts, resource metrics if present
-   - overall_health_score 0-100:
-       100 = fully healthy, no issues
-       80-99 = minor issues (info severity, transient)
-       60-79 = warning-level issues present
-       40-59 = multiple warnings or one degraded component
-       0-39 = critical failures or service unavailability
+   - overall_health_score 0-100. Compute DETERMINISTICALLY from evidence
+     using this rubric (start at 100, subtract; floor at 0):
+       * each CRITICAL identified_issue ............... -12
+       * each WARNING identified_issue ................ -6
+       * each INFO identified_issue ................... -2
+       * each OOMKilled in pods_terminated_by_reason .. -15 (extra)
+       * each CrashLoopBackOff in pods_waiting ........ -10 (extra)
+       * each [PEER-OUTLIER] >= 3.0σ ................... -10 (extra)
+       * each [NEAR-FULL] PVC (>=80%) .................. -10 (extra)
+       * each pod with restart_count > 0 in last 5 min . -8  (extra)
+     Score must vary with telemetry — identical scores across scans with
+     different evidence is a bug. If the score you computed equals the
+     prior scan's score but the issue list changed, recompute.
+   - health_status mapping (must agree with score):
+       100      = Healthy
+       60-99    = Degraded
+       0-59     = Critical
 
 ---------------------------------------------------------------------------------------
 RETURN FORMAT (STRICT JSON - no markdown fences, no extra text)
@@ -235,7 +253,17 @@ F. PROMETHEUS METRIC ANOMALIES (when METRICS section is present)
      N standard deviations above their namespace peers. This is direct
      evidence of resource-stress that DOES NOT require declared limits or
      visible kernel throttling. Flag the outlier pod with cpu-saturation
-     or memory-saturation. Sigma >= 3σ should be Critical, 2-3σ Warning.
+     or memory-saturation. Sigma >= 3σ should be Critical, 2.5-3σ Warning.
+   - "Pods restarted in last 5 min" rows: any pod listed had a restart in
+     the rolling window even if its current cumulative count is 0 (this
+     is how pod-delete and pod-recreate are detected — the new pod's
+     counter resets but increase() still fires). Flag pod-restart /
+     pod-recreated (Warning) for each such pod.
+   - "Pods reporting Ready=false" rows: pod is Running but failing readiness
+     probes — this is the canonical signal for network-loss, peer
+     connectivity broken, and sustained probe failure that hasn't yet
+     escalated to CrashLoop. Flag readiness-probe-failure or
+     peer-connectivity-loss (Critical) for each pod listed.
 
 G. POD COUNTS
    - desired vs ready replica mismatch in any deployment is anomalous.

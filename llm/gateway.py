@@ -784,13 +784,36 @@ def build_llm_data_payload(
         mem_outliers = prom.get("memory_outlier_pods", [])
         if cpu_outliers or mem_outliers:
             prom_lines.append(
-                "Peer-outlier pods (>=2σ above namespace mean — direct "
+                "Peer-outlier pods (>=2.5σ above namespace mean — direct "
                 "evidence of resource-stress regardless of declared limits):"
             )
             for o in cpu_outliers[:5]:
                 prom_lines.append(f"  - cpu  {o['pod']}: {o['sigma']:.1f}σ")
             for o in mem_outliers[:5]:
                 prom_lines.append(f"  - mem  {o['pod']}: {o['sigma']:.1f}σ")
+
+        # Recent restarts in last 5 min — captures pod-delete / pod-recreate
+        # via increase(), which fires even when the new pod's cumulative
+        # counter is 0.
+        recent = prom.get("recent_restarts", [])
+        if recent:
+            prom_lines.append(
+                "Pods restarted in last 5 min (recent recreation / "
+                "crash-loop / OOM-kill — fires regardless of cumulative count):"
+            )
+            for p in recent[:10]:
+                prom_lines.append(f"  - {p['pod']}: {p['value']:.1f}")
+
+        # Pods Ready=false — catches network-loss and sustained probe failure
+        # that don't progress to CrashLoop.
+        not_ready = prom.get("pods_not_ready", [])
+        if not_ready:
+            prom_lines.append(
+                "Pods reporting Ready=false (probe failure or peer "
+                "connectivity broken — direct evidence of partition / probe-fail):"
+            )
+            for pod in not_ready[:10]:
+                prom_lines.append(f"  - {pod}")
 
         if prom_lines:
             sections.append(
@@ -1062,6 +1085,83 @@ def request_llm_analysis(
         logger.error("LLM returned invalid JSON: %s", exc)
     except Exception as exc:
         logger.error("LLM analysis call failed: %s", exc)
+
+    # ── Deterministic score post-processor ─────────────────────────────────
+    # The LLM (temperature=0.1) was observed returning identical
+    # overall_health_score across baseline + active-fault scans. To make the
+    # score telemetry-responsive we recompute it deterministically here from
+    # the LLM's own issue list + the prom summary signals, and take the
+    # MORE pessimistic of (LLM, deterministic). This is purely floor-tightening:
+    # we never raise the LLM's score, only lower it when evidence demands.
+    if isinstance(result, dict):
+        try:
+            issues = result.get("identified_issues", []) or []
+            prom_s = (payload_summary.get("prometheus", {}) or {})
+            sev_count = {"critical": 0, "warning": 0, "info": 0}
+            for it in issues:
+                s = str(it.get("severity", "")).lower()
+                if s in sev_count:
+                    sev_count[s] += 1
+            # Extra deductions from explicit prom signals
+            term = prom_s.get("pods_terminated_by_reason", {}) or {}
+            wait = prom_s.get("pods_waiting_by_reason", {}) or {}
+            oom_n = len(term.get("OOMKilled", []) or [])
+            clb_n = len(wait.get("CrashLoopBackOff", []) or [])
+            cpu_o = prom_s.get("cpu_outlier_pods", []) or []
+            mem_o = prom_s.get("memory_outlier_pods", []) or []
+            big_outliers = sum(
+                1 for o in (cpu_o + mem_o)
+                if isinstance(o, dict) and (o.get("sigma") or 0) >= 3.0
+            )
+            vol_top = prom_s.get("volume_usage_top", []) or []
+            near_full = sum(
+                1 for v in vol_top
+                if isinstance(v, dict) and (v.get("ratio") or 0) >= 0.80
+            )
+            restarting = prom_s.get("restarting_pods", []) or []
+            recent_restarts_list = prom_s.get("recent_restarts", []) or []
+            # Use whichever is larger — recent_restarts (5-min window via
+            # increase()) catches pod-recreation that resets the cumulative
+            # counter; restarting_pods catches pods whose cumulative count
+            # is still non-zero. Both signals point to the same incident
+            # so we don't double-count.
+            recent_restarts = max(len(restarting), len(recent_restarts_list))
+            deduct = (
+                12 * sev_count["critical"]
+                + 6 * sev_count["warning"]
+                + 2 * sev_count["info"]
+                + 15 * oom_n
+                + 10 * clb_n
+                + 10 * big_outliers
+                + 10 * near_full
+                + min(8 * recent_restarts, 24)  # cap restart contribution
+            )
+            deterministic_score = max(0, 100 - deduct)
+            health = result.setdefault("health", {})
+            llm_score = health.get("overall_health_score")
+            try:
+                llm_score_int = int(llm_score) if llm_score is not None else 100
+            except (TypeError, ValueError):
+                llm_score_int = 100
+            final_score = min(llm_score_int, deterministic_score)
+            if final_score != llm_score_int:
+                logger.info(
+                    "Score post-process: llm=%s deterministic=%s final=%s "
+                    "(crit=%d warn=%d info=%d oom=%d clb=%d outl3s=%d nearfull=%d restarts=%d)",
+                    llm_score_int, deterministic_score, final_score,
+                    sev_count["critical"], sev_count["warning"], sev_count["info"],
+                    oom_n, clb_n, big_outliers, near_full, recent_restarts,
+                )
+            health["overall_health_score"] = final_score
+            # Re-derive health_status to stay consistent with the new score
+            env_s = result.setdefault("environment_state", {})
+            if final_score < 60:
+                env_s["health_status"] = "Critical"
+            elif final_score < 100:
+                env_s["health_status"] = "Degraded"
+            # 100 keeps whatever the LLM said (likely "Healthy")
+        except Exception as exc:
+            logger.warning("Score post-process skipped: %s", exc)
 
     duration = time.time() - t0
     logger.info("LLM analysis completed in %.2fs", duration)

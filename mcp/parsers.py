@@ -563,6 +563,11 @@ def _peer_outlier_sigma(rows: List[Dict[str, Any]]) -> Dict[str, float]:
     and zero-variance distributions (avoid div-by-zero). The z-score lets
     us flag peer outliers (CPU/memory hog, disk-fill) even when the
     workload declares no resource limits and the kernel never throttles.
+
+    Threshold: z >= 2.5σ AND value >= 1.5x median (anti-noise gate). The
+    1.5x median check filters out cases where a tight peer cluster causes
+    a pod to look like a high-sigma outlier despite the absolute delta
+    being trivial (e.g. all pods at ~0.001 cores).
     """
     vals = [r["value"] for r in rows if isinstance(r.get("value"), (int, float))]
     if len(vals) < 3:
@@ -572,6 +577,12 @@ def _peer_outlier_sigma(rows: List[Dict[str, Any]]) -> Dict[str, float]:
     sd = var ** 0.5
     if sd <= 0:
         return {}
+    sorted_vals = sorted(vals)
+    n = len(sorted_vals)
+    median = (
+        sorted_vals[n // 2] if n % 2
+        else (sorted_vals[n // 2 - 1] + sorted_vals[n // 2]) / 2
+    )
     out: Dict[str, float] = {}
     for r in rows:
         pod = r["labels"].get("pod") if isinstance(r.get("labels"), dict) else None
@@ -579,7 +590,10 @@ def _peer_outlier_sigma(rows: List[Dict[str, Any]]) -> Dict[str, float]:
         if not pod or not isinstance(v, (int, float)):
             continue
         z = (v - mean) / sd
-        if z >= 2.0:  # only retain meaningful upper-tail outliers
+        # Combined gate: z >= 2.5σ AND value at least 1.5x median
+        # (median > 0 required so we don't divide-by-zero or trip on
+        # baselines where everything is near-zero).
+        if z >= 2.5 and median > 0 and v >= 1.5 * median:
             out[pod] = round(z, 2)
     return out
 
@@ -755,6 +769,33 @@ def _summarize_prometheus(prom_data: Dict[str, Any]) -> Dict[str, Any]:
         hot = [v for v in vols if v["ratio"] >= 0.80]
         if hot:
             summary["volumes_near_full"] = hot
+
+    # Recent restart RATE (last 5 min). Survives pod-recreation because
+    # increase() captures any restart in the window even when the
+    # cumulative counter on the new pod is currently 0.
+    rate_rows = _parse_prom_instant(prom_data.get("restart_rate_per_pod"))
+    if rate_rows:
+        recent: List[Dict[str, Any]] = []
+        for r in rate_rows:
+            pod = r["labels"].get("pod")
+            v = r.get("value", 0)
+            if pod and v and v > 0:
+                recent.append({"pod": pod, "value": round(v, 2)})
+        recent.sort(key=lambda x: x["value"], reverse=True)
+        if recent:
+            summary["recent_restarts"] = recent[:10]
+
+    # Pods reporting Ready=false. Catches network-loss + sustained probe
+    # failures that don't escalate to CrashLoop.
+    nr_rows = _parse_prom_instant(prom_data.get("pods_not_ready"))
+    if nr_rows:
+        not_ready: List[str] = []
+        for r in nr_rows:
+            pod = r["labels"].get("pod")
+            if pod and r.get("value", 0) >= 1:
+                not_ready.append(pod)
+        if not_ready:
+            summary["pods_not_ready"] = sorted(set(not_ready))[:15]
 
     return summary
 
