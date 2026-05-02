@@ -154,11 +154,36 @@ def get_prometheus_tool_calls(
             )},
             "restarts_per_pod",
         ),
-        # Pod-phase distribution
+        # Pod-phase distribution.
+        #
+        # `kube_pod_status_phase` emits one series per (pod, phase) carrying
+        # value 1 for the pod's current phase and 0 for all others. Using
+        # `count by (phase)` would count *series* (= total pod count for every
+        # phase), producing nonsense like {Running:N, Failed:N, ...}. We must
+        # `sum` the values so only the active phase per pod contributes.
         (
             "execute_query",
-            {"query": f'count by (phase) (kube_pod_status_phase{{namespace="{ns}"}})'},
+            {"query": f'sum by (phase) (kube_pod_status_phase{{namespace="{ns}"}})'},
             "pod_phase_counts",
+        ),
+        # CPU CFS throttling rate per pod (seconds throttled per second).
+        # A non-zero value means the kernel is actively capping the
+        # container's CPU at its limit — a direct signal of CPU saturation
+        # that survives even if the rate(usage[1m]) average smooths over a
+        # short spike. Critical for detecting CPU-stress faults that hold
+        # the container pegged at its limit.
+        (
+            "execute_query",
+            {"query": (
+                f'sum by (pod) ('
+                f'rate(container_cpu_cfs_throttled_seconds_total{{namespace="{ns}",image!="",container!="POD"}}[1m])'
+                f')'
+                f' or '
+                f'sum by (pod) ('
+                f'rate(container_cpu_cfs_throttled_seconds_total{{namespace="{ns}",container=""}}[1m])'
+                f')'
+            )},
+            "cpu_throttle_per_pod",
         ),
         # Network receive bytes rate per pod (bytes/sec)
         (
@@ -169,6 +194,33 @@ def get_prometheus_tool_calls(
                 f')'
             )},
             "network_rx_per_pod",
+        ),
+        # Network transmit bytes rate per pod (bytes/sec). Symmetric signal
+        # to RX — a peer-outlier drop in TX while RX is normal indicates
+        # outbound network problems (e.g. partition, packet loss).
+        (
+            "execute_query",
+            {"query": (
+                f'sum by (pod) ('
+                f'rate(container_network_transmit_bytes_total{{namespace="{ns}"}}[1m])'
+                f')'
+            )},
+            "network_tx_per_pod",
+        ),
+        # Filesystem usage bytes per pod. Detects disk-fill / log-flood /
+        # tmpfs exhaustion faults invisible to CPU/memory/event channels.
+        (
+            "execute_query",
+            {"query": (
+                f'sum by (pod) ('
+                f'container_fs_usage_bytes{{namespace="{ns}",image!="",container!="POD"}}'
+                f')'
+                f' or '
+                f'sum by (pod) ('
+                f'container_fs_usage_bytes{{namespace="{ns}",container=""}}'
+                f')'
+            )},
+            "fs_usage_per_pod",
         ),
         # Declared CPU limit per pod (cores). Used to compute saturation
         # = usage / limit. Domain-agnostic anomaly detection.

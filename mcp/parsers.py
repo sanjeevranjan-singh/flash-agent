@@ -638,6 +638,29 @@ def _summarize_prometheus(prom_data: Dict[str, Any]) -> Dict[str, Any]:
     if net_rows:
         summary["network_rx_per_pod_top"] = _top_pods(net_rows)
 
+    tx_rows = _parse_prom_instant(prom_data.get("network_tx_per_pod"))
+    if tx_rows:
+        summary["network_tx_per_pod_top"] = _top_pods(tx_rows)
+
+    # CPU throttling rate (seconds throttled per second). Non-zero is direct
+    # evidence the kernel is capping the container at its CPU limit.
+    throttle_rows = _parse_prom_instant(prom_data.get("cpu_throttle_per_pod"))
+    if throttle_rows:
+        summary["cpu_throttle_per_pod_top"] = _top_pods(throttle_rows)
+        summary["throttling_pods"] = [
+            p for p in summary["cpu_throttle_per_pod_top"] if p["value"] > 0.001
+        ]
+
+    # Filesystem usage in MB per pod, peer-comparison signal for disk-fill
+    # / log-flood / tmpfs-exhaustion faults.
+    fs_rows = _parse_prom_instant(prom_data.get("fs_usage_per_pod"))
+    if fs_rows:
+        fs_mb = [
+            {"labels": r["labels"], "value": r["value"] / (1024 * 1024)}
+            for r in fs_rows
+        ]
+        summary["fs_usage_per_pod_top_mb"] = _top_pods(fs_mb)
+
     return summary
 
 

@@ -190,19 +190,33 @@ F. PROMETHEUS METRIC ANOMALIES (when METRICS section is present)
    - prometheus_targets_up: any value < total expected targets means a
      scrape target is down (the application or its sidecar is unreachable).
    - restarts_per_pod: any pod with a non-zero value is direct evidence of
-     past failure (cross-check with pod restart count).
+     past failure (cross-check with pod restart count). When the rendered
+     line says "no recent crash-loop / OOMKill", treat that as confirmed
+     negative — saturation without restarts is a resource-stress fault,
+     not a crash.
    - cpu_per_pod / memory_per_pod: these are RAW USAGE values in cores /
-     bytes. Do NOT require a "limit" or "saturation %" to flag them.
-     Treat as anomalous when:
+     bytes, rendered with `value / limit (NN% of limit)` when the pod
+     declares a limit. Treat as anomalous when:
+       * saturation reaches >=80% of the declared limit (resource ceiling),
        * a single pod's usage is dramatically higher than its peers in
          the same namespace (order-of-magnitude outlier),
        * usage trends sharply against the historical baseline of the same
          pod (when prior values are present in the data),
        * memory grows monotonically (memory leak signature).
-     If neither outlier nor trend is present, do not invent a saturation
-     issue.
-   - network_rx_per_pod: a pod whose RX rate drops to zero while peers
-     continue to receive traffic is observably partitioned.
+     If neither outlier, ceiling, nor trend is present, do not invent a
+     saturation issue.
+   - cpu_throttle_per_pod: a non-zero value is the kernel actively capping
+     a container at its CPU limit — direct evidence of CPU stress that is
+     visible even when the rate(usage) average smooths the spike out. If
+     a pod is throttled, flag CPU-stress with the throttled pod as
+     affected_component regardless of where it ranks in cpu_per_pod_top.
+   - network_rx_per_pod / network_tx_per_pod: a pod whose RX or TX rate
+     drops to zero while peers continue to communicate is observably
+     partitioned (network fault). RX-only or TX-only zero is asymmetric
+     loss; both zero is full isolation.
+   - fs_usage_per_pod_top_mb: a pod whose filesystem usage is an
+     order-of-magnitude peer outlier, or that grows monotonically across
+     scans, indicates a disk-fill / log-flood / tmpfs-exhaustion fault.
 
 G. POD COUNTS
    - desired vs ready replica mismatch in any deployment is anomalous.

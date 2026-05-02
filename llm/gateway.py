@@ -664,37 +664,76 @@ def build_llm_data_payload(
         # raw values — no precomputed saturation glyph or absolute-threshold
         # marker is injected. This matches the AIOpsLab observation model:
         # the agent gets telemetry, not preconcluded verdicts.
+        #
+        # When a `limit` is declared we render saturation as a percentage
+        # (`78% of limit`) so peer-outlier and ceiling-saturation faults
+        # are visually obvious without the LLM having to divide.
         def _fmt_raw(p: Dict[str, Any], unit: str) -> str:
             value = p["value"]
             limit = p.get("limit")
+            sat = p.get("saturation")
             base = f"  - {p['pod']}: {value:.3f}{unit}"
             if limit is not None:
-                base += f" (declared limit {limit:.3f}{unit})"
+                base += f" / limit {limit:.3f}{unit}"
+                if sat is not None:
+                    base += f" ({sat * 100:.0f}% of limit)"
             return base
 
         cpu_top = prom.get("cpu_per_pod_top", [])
         if cpu_top:
             prom_lines.append("Top CPU pods (cores, current rate):")
-            for p in cpu_top[:5]:
+            for p in cpu_top[:10]:
                 prom_lines.append(_fmt_raw(p, " cores"))
 
         mem_top = prom.get("memory_per_pod_top_mb", [])
         if mem_top:
             prom_lines.append("Top memory pods (MB, working set):")
-            for p in mem_top[:5]:
+            for p in mem_top[:10]:
                 prom_lines.append(_fmt_raw(p, " MB"))
 
+        # Restart counts: explicit positive AND negative signal so the LLM
+        # can disambiguate "saturation without crashes" (resource fault) vs
+        # "saturation with crashes" (OOMKill / liveness-probe failure).
+        restart_top = prom.get("restarts_per_pod_top", [])
         restarting = prom.get("restarting_pods", [])
         if restarting:
-            prom_lines.append("Pods with restarts (cumulative):")
-            for p in restarting[:5]:
+            prom_lines.append("Pods with restarts (cumulative, non-zero only):")
+            for p in restarting[:10]:
                 prom_lines.append(f"  - {p['pod']}: {int(p['value'])}")
+        elif restart_top:
+            prom_lines.append(
+                "Pods with restarts: none (all 0) — no recent crash-loop / "
+                "OOMKill in this namespace"
+            )
+
+        # CPU throttling — direct kernel-cap signal independent of usage rate.
+        throttling = prom.get("throttling_pods", [])
+        if throttling:
+            prom_lines.append(
+                "Pods being CPU-throttled (sec/sec, non-zero only — kernel "
+                "is capping these pods at their CPU limit):"
+            )
+            for p in throttling[:10]:
+                prom_lines.append(f"  - {p['pod']}: {p['value']:.3f}")
 
         net_top = prom.get("network_rx_per_pod_top", [])
         if net_top:
             prom_lines.append("Top network RX pods (bytes/sec):")
-            for p in net_top[:3]:
+            for p in net_top[:5]:
                 prom_lines.append(f"  - {p['pod']}: {p['value']:.0f}")
+
+        tx_top = prom.get("network_tx_per_pod_top", [])
+        if tx_top:
+            prom_lines.append("Top network TX pods (bytes/sec):")
+            for p in tx_top[:5]:
+                prom_lines.append(f"  - {p['pod']}: {p['value']:.0f}")
+
+        # Filesystem usage — covers disk-fill / log-flood / tmpfs faults.
+        fs_top = prom.get("fs_usage_per_pod_top_mb", [])
+        if fs_top:
+            prom_lines.append("Top filesystem usage pods (MB):")
+            for p in fs_top[:5]:
+                prom_lines.append(f"  - {p['pod']}: {p['value']:.1f} MB")
 
         if prom_lines:
             sections.append(
