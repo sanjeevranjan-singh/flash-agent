@@ -166,9 +166,10 @@ def _build_structured_analysis_user_content(
         # Hide the agent itself + chaos infra from the topology view: a real
         # SRE on-call would not consider their own monitoring sidecar a peer
         # of the workload, and chaos infra components must never reach the
-        # LLM (blind-observer rule).
+        # LLM (blind-observer rule).  The agent's own deployment name comes
+        # from cfg.agent_name so any agent (not just flash-agent) self-hides.
         _HIDE = {
-            "flash-agent", "litellm", "litellm-proxy",
+            cfg.agent_name, "litellm", "litellm-proxy",
             "chaos-exporter", "chaos-operator", "chaos-runner",
             "subscriber", "event-tracker", "workflow-controller",
             "kubernetes-mcp-server", "prometheus-mcp-server",

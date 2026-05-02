@@ -220,9 +220,7 @@ def build_mcp_data_summary(response_payload: Dict[str, Any], include_chaos: bool
             for key in ("name=", "app.kubernetes.io/name=", "app="):
                 if key in labels_blob:
                     val = labels_blob.split(key, 1)[1].split(",", 1)[0].strip()
-                    if val and val != "flash-agent":
-                        return val
-                    if val == "flash-agent":
+                    if val:
                         return val
             stripped = _DEPLOY_HASH_RE.sub("", pod_name)
             return stripped or pod_name
