@@ -672,11 +672,14 @@ def build_llm_data_payload(
             value = p["value"]
             limit = p.get("limit")
             sat = p.get("saturation")
+            sigma = p.get("sigma")
             base = f"  - {p['pod']}: {value:.3f}{unit}"
             if limit is not None:
                 base += f" / limit {limit:.3f}{unit}"
                 if sat is not None:
                     base += f" ({sat * 100:.0f}% of limit)"
+            if sigma is not None:
+                base += f"  [PEER-OUTLIER {sigma:.1f}σ]"
             return base
 
         cpu_top = prom.get("cpu_per_pod_top", [])
@@ -734,6 +737,60 @@ def build_llm_data_payload(
             prom_lines.append("Top filesystem usage pods (MB):")
             for p in fs_top[:5]:
                 prom_lines.append(f"  - {p['pod']}: {p['value']:.1f} MB")
+
+        # PVC / volume utilisation — alternative path for disk-fill on
+        # clusters whose cAdvisor strips pod labels off container_fs_*.
+        vol_top = prom.get("volume_usage_top", [])
+        if vol_top:
+            prom_lines.append(
+                "Top PVC / volume usage (used / capacity ratio):"
+            )
+            for v in vol_top[:5]:
+                pct = v["ratio"] * 100
+                tag = "  [NEAR-FULL]" if v["ratio"] >= 0.80 else ""
+                prom_lines.append(
+                    f"  - {v['pod']} (pvc={v['pvc']}): {pct:.1f}%{tag}"
+                )
+
+        # Container waiting reasons — kubelet-emitted, fires regardless of
+        # whether limits exist or which cAdvisor variant is running.
+        # Catches pod-delete (Terminating loop), image rollouts, and
+        # CrashLoop spirals.
+        waiting = prom.get("pods_waiting_by_reason", {})
+        if waiting:
+            prom_lines.append("Pods stuck in waiting state (kubelet status):")
+            for reason, pods in waiting.items():
+                pod_list = ", ".join(pods[:5])
+                more = f" (+{len(pods)-5} more)" if len(pods) > 5 else ""
+                prom_lines.append(f"  - {reason}: {pod_list}{more}")
+
+        # Terminated reasons — OOMKilled is the canonical memory-hog signal,
+        # present even when no memory limit is declared.
+        terminated = prom.get("pods_terminated_by_reason", {})
+        if terminated:
+            prom_lines.append(
+                "Pods with non-Completed last-terminated reason "
+                "(OOMKilled / Error / etc):"
+            )
+            for reason, pods in terminated.items():
+                pod_list = ", ".join(pods[:5])
+                more = f" (+{len(pods)-5} more)" if len(pods) > 5 else ""
+                prom_lines.append(f"  - {reason}: {pod_list}{more}")
+
+        # Peer-outlier callouts — independent of resource limits. A pod
+        # whose CPU or memory is N stdev above its peers is anomalous
+        # even when no throttle / saturation signal exists.
+        cpu_outliers = prom.get("cpu_outlier_pods", [])
+        mem_outliers = prom.get("memory_outlier_pods", [])
+        if cpu_outliers or mem_outliers:
+            prom_lines.append(
+                "Peer-outlier pods (>=2σ above namespace mean — direct "
+                "evidence of resource-stress regardless of declared limits):"
+            )
+            for o in cpu_outliers[:5]:
+                prom_lines.append(f"  - cpu  {o['pod']}: {o['sigma']:.1f}σ")
+            for o in mem_outliers[:5]:
+                prom_lines.append(f"  - mem  {o['pod']}: {o['sigma']:.1f}σ")
 
         if prom_lines:
             sections.append(

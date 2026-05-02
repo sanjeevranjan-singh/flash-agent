@@ -556,6 +556,34 @@ def _top_pods(rows: List[Dict[str, Any]], limit: int = 10) -> List[Dict[str, Any
     return out
 
 
+def _peer_outlier_sigma(rows: List[Dict[str, Any]]) -> Dict[str, float]:
+    """Return {pod: z_score} computed across the per-pod values in `rows`.
+
+    Robust to clusters with ≤2 pods (returns empty dict — no peer baseline)
+    and zero-variance distributions (avoid div-by-zero). The z-score lets
+    us flag peer outliers (CPU/memory hog, disk-fill) even when the
+    workload declares no resource limits and the kernel never throttles.
+    """
+    vals = [r["value"] for r in rows if isinstance(r.get("value"), (int, float))]
+    if len(vals) < 3:
+        return {}
+    mean = sum(vals) / len(vals)
+    var = sum((v - mean) ** 2 for v in vals) / len(vals)
+    sd = var ** 0.5
+    if sd <= 0:
+        return {}
+    out: Dict[str, float] = {}
+    for r in rows:
+        pod = r["labels"].get("pod") if isinstance(r.get("labels"), dict) else None
+        v = r.get("value")
+        if not pod or not isinstance(v, (int, float)):
+            continue
+        z = (v - mean) / sd
+        if z >= 2.0:  # only retain meaningful upper-tail outliers
+            out[pod] = round(z, 2)
+    return out
+
+
 def _summarize_prometheus(prom_data: Dict[str, Any]) -> Dict[str, Any]:
     """Build a compact summary of Prometheus snapshot keyed by result_key.
 
@@ -590,6 +618,7 @@ def _summarize_prometheus(prom_data: Dict[str, Any]) -> Dict[str, Any]:
     # ── CPU usage + saturation ────────────────────────────────────────────
     cpu_rows = _parse_prom_instant(prom_data.get("cpu_per_pod"))
     if cpu_rows:
+        cpu_sigmas = _peer_outlier_sigma(cpu_rows)
         enriched = []
         for r in cpu_rows:
             pod = r["labels"].get("pod", "")
@@ -600,12 +629,19 @@ def _summarize_prometheus(prom_data: Dict[str, Any]) -> Dict[str, Any]:
                 "value": r["value"],
                 "limit": limit,
                 "saturation": sat,
+                "sigma": cpu_sigmas.get(pod),
             })
         summary["cpu_per_pod_top"] = _top_pods_with_sat(enriched)
+        if cpu_sigmas:
+            summary["cpu_outlier_pods"] = [
+                {"pod": p, "sigma": s} for p, s in
+                sorted(cpu_sigmas.items(), key=lambda kv: -kv[1])
+            ]
 
     # ── memory usage + saturation ─────────────────────────────────────────
     mem_rows = _parse_prom_instant(prom_data.get("memory_per_pod"))
     if mem_rows:
+        mem_sigmas = _peer_outlier_sigma(mem_rows)
         enriched = []
         for r in mem_rows:
             pod = r["labels"].get("pod", "")
@@ -616,8 +652,14 @@ def _summarize_prometheus(prom_data: Dict[str, Any]) -> Dict[str, Any]:
                 "value": r["value"] / (1024 * 1024),  # MB
                 "limit": (limit / (1024 * 1024)) if limit else None,
                 "saturation": sat,
+                "sigma": mem_sigmas.get(pod),
             })
         summary["memory_per_pod_top_mb"] = _top_pods_with_sat(enriched)
+        if mem_sigmas:
+            summary["memory_outlier_pods"] = [
+                {"pod": p, "sigma": s} for p, s in
+                sorted(mem_sigmas.items(), key=lambda kv: -kv[1])
+            ]
 
     restart_rows = _parse_prom_instant(prom_data.get("restarts_per_pod"))
     if restart_rows:
@@ -661,11 +703,64 @@ def _summarize_prometheus(prom_data: Dict[str, Any]) -> Dict[str, Any]:
         ]
         summary["fs_usage_per_pod_top_mb"] = _top_pods(fs_mb)
 
+    # Container waiting reasons (CrashLoopBackOff, ImagePullBackOff,
+    # ContainerCreating, …). Each row carries (pod, reason); we group as
+    # {reason: [pods]}. Direct kubelet-emitted signal that survives all
+    # cluster shapes — fires for pod-delete, image rollouts, OOMKill loops.
+    waiting_rows = _parse_prom_instant(prom_data.get("container_waiting_reason"))
+    if waiting_rows:
+        wait_by_reason: Dict[str, List[str]] = {}
+        for r in waiting_rows:
+            if r["value"] < 1:
+                continue
+            reason = r["labels"].get("reason", "Unknown")
+            pod = r["labels"].get("pod")
+            if not pod:
+                continue
+            wait_by_reason.setdefault(reason, []).append(pod)
+        if wait_by_reason:
+            summary["pods_waiting_by_reason"] = wait_by_reason
+
+    # Last-terminated reasons (OOMKilled, Error, …). OOMKilled is the
+    # canonical memory-hog signal, present even when no memory limit is
+    # declared (kernel still records the kill).
+    term_rows = _parse_prom_instant(prom_data.get("container_terminated_reason"))
+    if term_rows:
+        term_by_reason: Dict[str, List[str]] = {}
+        for r in term_rows:
+            if r["value"] < 1:
+                continue
+            reason = r["labels"].get("reason", "Unknown")
+            pod = r["labels"].get("pod")
+            if not pod:
+                continue
+            term_by_reason.setdefault(reason, []).append(pod)
+        if term_by_reason:
+            summary["pods_terminated_by_reason"] = term_by_reason
+
+    # PVC / volume utilisation ratio (used / capacity). Carries pod +
+    # persistentvolumeclaim labels even on stripped cAdvisor — alternative
+    # path to disk-fill detection when container_fs_usage is unlabelled.
+    vol_rows = _parse_prom_instant(prom_data.get("volume_usage_ratio"))
+    if vol_rows:
+        vols: List[Dict[str, Any]] = []
+        for r in vol_rows:
+            pvc = r["labels"].get("persistentvolumeclaim", "?")
+            pod = r["labels"].get("pod") or pvc
+            ratio = r["value"]
+            vols.append({"pod": pod, "pvc": pvc, "ratio": round(ratio, 4)})
+        vols.sort(key=lambda v: v["ratio"], reverse=True)
+        summary["volume_usage_top"] = vols[:10]
+        # Highlight any PVC over 80% — strong disk-fill signal.
+        hot = [v for v in vols if v["ratio"] >= 0.80]
+        if hot:
+            summary["volumes_near_full"] = hot
+
     return summary
 
 
 def _top_pods_with_sat(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Like _top_pods but preserves limit/saturation fields."""
+    """Like _top_pods but preserves limit/saturation/sigma fields."""
     out: List[Dict[str, Any]] = []
     for r in sorted(rows, key=lambda x: x["value"], reverse=True):
         pod = r["labels"].get("pod")
@@ -676,5 +771,6 @@ def _top_pods_with_sat(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             "value": round(r["value"], 4),
             "limit": round(r["limit"], 4) if r.get("limit") is not None else None,
             "saturation": round(r["saturation"], 4) if r.get("saturation") is not None else None,
+            "sigma": r.get("sigma"),
         })
     return out

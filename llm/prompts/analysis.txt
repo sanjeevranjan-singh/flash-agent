@@ -217,6 +217,25 @@ F. PROMETHEUS METRIC ANOMALIES (when METRICS section is present)
    - fs_usage_per_pod_top_mb: a pod whose filesystem usage is an
      order-of-magnitude peer outlier, or that grows monotonically across
      scans, indicates a disk-fill / log-flood / tmpfs-exhaustion fault.
+   - "Top PVC / volume usage" rows tagged [NEAR-FULL] (>=80%) are direct
+     evidence of disk-fill on PVC-backed volumes, independent of cAdvisor
+     fs labels. Treat as a high-severity disk fault.
+   - "Pods stuck in waiting state" rows are kubelet-emitted status, fire
+     regardless of resource limits. Reasons map to faults:
+       * CrashLoopBackOff → flag crash-loop-backoff (Critical)
+       * ImagePullBackOff / ErrImagePull → flag image-pull-failure
+       * ContainerCreating beyond ~30s → flag stuck-creating
+       * ContainerStatusUnknown → flag node/runtime issue
+   - "Pods with non-Completed last-terminated reason" rows:
+       * OOMKilled → flag oom-kill / memory-saturation (Critical) — this
+         signal is present even when no memory limit is declared, because
+         the kernel records the kill regardless.
+       * Error → flag container-error-exit
+   - Lines tagged [PEER-OUTLIER N.Nσ] mark pods whose CPU or memory is
+     N standard deviations above their namespace peers. This is direct
+     evidence of resource-stress that DOES NOT require declared limits or
+     visible kernel throttling. Flag the outlier pod with cpu-saturation
+     or memory-saturation. Sigma >= 3σ should be Critical, 2-3σ Warning.
 
 G. POD COUNTS
    - desired vs ready replica mismatch in any deployment is anomalous.

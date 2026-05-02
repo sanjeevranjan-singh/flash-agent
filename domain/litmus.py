@@ -243,6 +243,49 @@ def get_prometheus_tool_calls(
             )},
             "memory_limit_per_pod",
         ),
+        # Container wait reasons per pod (CrashLoopBackOff, ImagePullBackOff,
+        # ContainerCreating, ErrImagePull, …). Emitted directly by the kubelet
+        # via kube-state-metrics — works regardless of whether the workload
+        # declares resource limits or which cAdvisor variant is running. Any
+        # row with value 1 is direct evidence the kubelet has the container
+        # parked in that state. Critical for catching pod-delete + image
+        # rollout faults that are invisible to CPU/memory channels.
+        (
+            "execute_query",
+            {"query": (
+                f'sum by (pod, reason) ('
+                f'kube_pod_container_status_waiting_reason{{namespace="{ns}"}} > 0'
+                f')'
+            )},
+            "container_waiting_reason",
+        ),
+        # Last-terminated reason per pod (OOMKilled, Error, Completed, …).
+        # OOMKilled is the canonical memory-hog signal — it survives even when
+        # no memory limit is declared (the kernel still records the kill if
+        # one occurred). ContainerStatusUnknown / Error catch crash-on-start.
+        (
+            "execute_query",
+            {"query": (
+                f'sum by (pod, reason) ('
+                f'kube_pod_container_status_last_terminated_reason{{namespace="{ns}"}} > 0'
+                f')'
+            )},
+            "container_terminated_reason",
+        ),
+        # PVC / volume utilisation: used vs capacity bytes. Carries `pod` +
+        # `persistentvolumeclaim` labels even on stripped-down cAdvisor
+        # variants (it's emitted by the kubelet stats endpoint, not cAdvisor),
+        # so it survives clusters where `container_fs_usage_bytes` is
+        # node-only. Detects disk-fill / log-flood / volume-exhaustion.
+        (
+            "execute_query",
+            {"query": (
+                f'kubelet_volume_stats_used_bytes{{namespace="{ns}"}}'
+                f' / on(persistentvolumeclaim, namespace) '
+                f'kubelet_volume_stats_capacity_bytes{{namespace="{ns}"}}'
+            )},
+            "volume_usage_ratio",
+        ),
     ]
 
 
