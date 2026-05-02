@@ -51,6 +51,20 @@ signal.signal(signal.SIGTERM, _handle_signal)
 signal.signal(signal.SIGINT, _handle_signal)
 
 
+def _touch(path: str) -> None:
+    """Best-effort touch of a probe marker file."""
+    if not path:
+        return
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        # mtime is what the liveness probe reads via stat -c %Y.
+        with open(path, "a", encoding="utf-8"):
+            pass
+        os.utime(path, None)
+    except Exception as exc:  # don't crash the agent over a probe file
+        logger.debug("Failed to touch %s: %s", path, exc)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Entry point
 # ══════════════════════════════════════════════════════════════════════════════
@@ -91,6 +105,8 @@ def main() -> None:
     if cfg.scan_interval <= 0:
         logger.info("CronJob mode – single scan")
         agent.scan(cfg.scan_query)
+        _touch(cfg.alive_file)
+        _touch(cfg.ready_file)
     else:
         logger.info(
             "Continuous mode \u2013 scan every %ds (fast=%ds when health<%d)",
@@ -100,8 +116,16 @@ def main() -> None:
             analysis: Any = None
             try:
                 analysis = agent.scan(cfg.scan_query)
+                # Successful scan → mark ready (first time only matters) and
+                # bump alive-file mtime so liveness probe stays green.
+                _touch(cfg.ready_file)
             except Exception as exc:
                 logger.exception("Scan cycle failed: %s", exc)
+            finally:
+                # alive even on failure prevents flapping during a single
+                # transient LLM/MCP error; liveness staleness window
+                # (livenessStaleSeconds in chart) catches sustained hangs.
+                _touch(cfg.alive_file)
 
             # Adaptive interval: speed up while health is degraded
             interval = cfg.scan_interval

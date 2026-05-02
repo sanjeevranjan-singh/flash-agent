@@ -82,6 +82,18 @@ class AgentConfig:
     langfuse_public_key: str
     langfuse_secret_key: str
 
+    # Persistence + health probes (deployment mode)
+    # ---------------------------------------------
+    # watermark_file: when set, the agent loads/saves the MCP event
+    # watermark to this path so pod restarts do not re-flag stale signals.
+    # Empty string disables persistence (in-memory only — fine for cronjob).
+    # ready_file / alive_file: marker files touched by the agent so the
+    # K8s readinessProbe / livenessProbe can verify the scan loop is
+    # actually making progress.
+    watermark_file: str
+    ready_file: str
+    alive_file: str
+
     @classmethod
     def from_env(cls) -> AgentConfig:
         """Create configuration from environment variables."""
@@ -129,6 +141,9 @@ class AgentConfig:
             langfuse_host=os.getenv("LANGFUSE_HOST", ""),
             langfuse_public_key=os.getenv("LANGFUSE_PUBLIC_KEY", ""),
             langfuse_secret_key=os.getenv("LANGFUSE_SECRET_KEY", ""),
+            watermark_file=os.getenv("WATERMARK_FILE", ""),
+            ready_file=os.getenv("READY_FILE", "/tmp/flash-agent-ready"),
+            alive_file=os.getenv("ALIVE_FILE", "/tmp/flash-agent-alive"),
         )
 
     def validate(self) -> list[str]:

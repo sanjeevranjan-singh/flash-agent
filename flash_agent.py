@@ -77,6 +77,50 @@ class FlashAgent:
         # leak into experiment N+1's first scan.
         self._watermark_notify_id: str = ""
 
+        # Restore watermark from disk if persistence is configured. This
+        # makes the long-running deployment mode resilient to pod restarts
+        # / image upgrades — without it, every restart re-flags ~minutes
+        # of stale signals until the in-memory watermark catches up.
+        self._load_watermark()
+
+    def _load_watermark(self) -> None:
+        path = getattr(self.cfg, "watermark_file", "") or ""
+        if not path:
+            return
+        try:
+            if not os.path.exists(path):
+                return
+            with open(path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            ts_str = data.get("watermark_ts") or ""
+            notify = data.get("notify_id") or ""
+            if ts_str:
+                self._last_event_watermark_ts = datetime.fromisoformat(ts_str)
+                self._watermark_notify_id = notify
+                logger.info(
+                    "Watermark restored from %s (ts=%s notify=%s)",
+                    path, ts_str, notify or "<empty>",
+                )
+        except Exception as exc:
+            logger.warning("Failed to load watermark from %s: %s", path, exc)
+
+    def _save_watermark(self) -> None:
+        path = getattr(self.cfg, "watermark_file", "") or ""
+        if not path or self._last_event_watermark_ts is None:
+            return
+        try:
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+            tmp = f"{path}.tmp"
+            payload = {
+                "watermark_ts": self._last_event_watermark_ts.isoformat(),
+                "notify_id": self._watermark_notify_id,
+            }
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh)
+            os.replace(tmp, path)
+        except Exception as exc:
+            logger.warning("Failed to persist watermark to %s: %s", path, exc)
+
     # ══════════════════════════════════════════════════════════════════════════
     # Public Interface (AgentInterface protocol)
     # ══════════════════════════════════════════════════════════════════════════
@@ -358,6 +402,7 @@ class FlashAgent:
         # slack). A failed scan leaves the watermark unchanged so we don't
         # silently blank out evidence.
         self._last_event_watermark_ts = datetime.now(timezone.utc)
+        self._save_watermark()
 
         return analysis
 
